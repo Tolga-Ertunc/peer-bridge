@@ -1,0 +1,259 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Peer bridge</title>
+<style>
+  :root {
+    --bg: var(--color-background-primary, #ffffff);
+    --bg2: var(--color-background-secondary, #f4f4f2);
+    --fg: var(--color-text-primary, #1d1d1b);
+    --fg2: var(--color-text-secondary, #6b6b66);
+    --line: var(--color-border-secondary, #e2e1dc);
+    --ok: var(--color-text-success, #2f7d4f);
+    --bad: var(--color-text-danger, #b3261e);
+    --warn: var(--color-text-warning, #9a6700);
+    --font: var(--font-sans, system-ui, -apple-system, "Segoe UI", sans-serif);
+    --mono: var(--font-mono, ui-monospace, "Cascadia Mono", Consolas, monospace);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: var(--color-background-primary, #1f1f1e);
+      --bg2: var(--color-background-secondary, #2a2a28);
+      --fg: var(--color-text-primary, #ecebe6);
+      --fg2: var(--color-text-secondary, #a3a29b);
+      --line: var(--color-border-secondary, #3a3a37);
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 12px 14px; background: var(--bg); color: var(--fg); font: 13px/1.45 var(--font); }
+  header { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+  h1 { font-size: 14px; margin: 0; font-weight: 600; }
+  .muted { color: var(--fg2); }
+  .chips { display: flex; gap: 6px; flex-wrap: wrap; margin: 8px 0; }
+  .chip { border: 1px solid var(--line); border-radius: 999px; padding: 1px 8px; font-size: 12px; }
+  .chip.ok { color: var(--ok); } .chip.bad { color: var(--bad); }
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 6px; margin: 8px 0; }
+  .stat { background: var(--bg2); border-radius: 6px; padding: 6px 8px; }
+  .stat b { display: block; font-size: 15px; font-variant-numeric: tabular-nums; }
+  .row { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; margin: 8px 0; }
+  button { font: inherit; color: var(--fg); background: var(--bg2); border: 1px solid var(--line); border-radius: 6px; padding: 4px 10px; cursor: pointer; }
+  button:hover { border-color: var(--fg2); }
+  label { display: inline-flex; gap: 4px; align-items: center; }
+  ol { list-style: none; margin: 6px 0 0; padding: 0; max-height: 220px; overflow: auto; font: 12px/1.4 var(--mono); border-top: 1px solid var(--line); }
+  li { padding: 3px 0; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+  li .t { color: var(--fg2); margin-right: 6px; }
+  li.ok { color: var(--ok); } li.bad { color: var(--bad); } li.warn { color: var(--warn); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Peer bridge</h1>
+  <span class="muted" id="who">connecting…</span>
+</header>
+<div class="chips" id="caps"></div>
+<div class="stats">
+  <div class="stat"><span class="muted">polls</span><b id="s-polls">0</b></div>
+  <div class="stat"><span class="muted">max poll gap</span><b id="s-gap">–</b></div>
+  <div class="stat"><span class="muted">wakes sent</span><b id="s-wakes">0</b></div>
+  <div class="stat"><span class="muted">visibility</span><b id="s-vis">–</b></div>
+</div>
+<div class="row">
+  <label><input type="checkbox" id="auto" checked> auto-wake</label>
+  <button id="btn-now">Test ui/message now</button>
+  <button id="btn-delay">Test in 15 s (no click)</button>
+</div>
+<ol id="log"></ol>
+
+<script>
+(() => {
+  const POLL_MS = 3000;
+  const widgetId = "w" + Math.random().toString(36).slice(2, 8);
+  const $ = (id) => document.getElementById(id);
+  const stats = { polls: 0, maxGap: 0, wakes: 0 };
+  let hostName = "unknown", hostCaps = {}, side = "?", nextId = 1, lastPollAt = 0, stopped = false;
+  const pending = new Map();
+
+  function log(msg, cls = "") {
+    const li = document.createElement("li");
+    li.className = cls;
+    li.innerHTML = `<span class="t">${new Date().toLocaleTimeString()}</span>`;
+    li.append(document.createTextNode(msg));
+    $("log").prepend(li);
+    while ($("log").children.length > 40) $("log").lastChild.remove();
+    resize();
+  }
+
+  // ---- JSON-RPC over postMessage (MCP Apps, protocol 2026-01-26)
+  function send(msg) { window.parent.postMessage({ jsonrpc: "2.0", ...msg }, "*"); }
+  function request(method, params, timeoutMs = 20000) {
+    const id = nextId++;
+    send({ id, method, params });
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => { pending.delete(id); reject(new Error(`${method} timed out`)); }, timeoutMs);
+      pending.set(id, { resolve, reject, timer });
+    });
+  }
+  function notify(method, params = {}) { send({ method, params }); }
+
+  window.addEventListener("message", (ev) => {
+    if (ev.source !== window.parent) return;
+    const m = ev.data;
+    if (!m || m.jsonrpc !== "2.0") return;
+    if (m.id !== undefined && !m.method) {
+      const p = pending.get(m.id);
+      if (!p) return;
+      pending.delete(m.id); clearTimeout(p.timer);
+      m.error ? p.reject(new Error(m.error.message || JSON.stringify(m.error))) : p.resolve(m.result);
+      return;
+    }
+    if (m.method === "ping") return send({ id: m.id, result: {} });
+    if (m.method === "ui/resource-teardown") {
+      stopped = true;
+      report("teardown", m.params);
+      log("host requested teardown", "warn");
+      return send({ id: m.id, result: {} });
+    }
+    if (m.method === "ui/notifications/tool-result") {
+      const sc = m.params && m.params.structuredContent;
+      if (sc && sc.side) { side = sc.side; renderWho(); }
+      return;
+    }
+    if (m.method === "ui/notifications/host-context-changed" && m.params && m.params.theme) {
+      document.documentElement.setAttribute("data-theme", m.params.theme);
+    }
+    if (m.id !== undefined) send({ id: m.id, error: { code: -32601, message: "method not found" } });
+  });
+
+  function resize() {
+    const h = Math.ceil(document.documentElement.getBoundingClientRect().height);
+    notify("ui/notifications/size-changed", { width: Math.ceil(window.innerWidth), height: h });
+  }
+
+  async function tool(name, args) {
+    const r = await request("tools/call", { name, arguments: args });
+    if (r && r.isError) throw new Error((r.content && r.content[0] && r.content[0].text) || "tool error");
+    return (r && r.structuredContent) || JSON.parse(r.content[0].text);
+  }
+  function report(event, data) {
+    return tool("bridge_report", { widgetId, event, data }).catch(() => {});
+  }
+
+  function renderWho() { $("who").textContent = `side: ${side} · host: ${hostName} · panel ${widgetId}`; }
+  function renderCaps() {
+    const caps = [
+      ["ui/message", !!hostCaps.message],
+      ["server tools", !!hostCaps.serverTools],
+      ["model context", !!hostCaps.updateModelContext],
+      ["window.openai", !!window.openai],
+    ];
+    $("caps").innerHTML = "";
+    for (const [k, v] of caps) {
+      const c = document.createElement("span");
+      c.className = "chip " + (v ? "ok" : "bad");
+      c.textContent = (v ? "✓ " : "✗ ") + k;
+      $("caps").append(c);
+    }
+  }
+  function renderStats() {
+    $("s-polls").textContent = stats.polls;
+    $("s-gap").textContent = stats.maxGap ? (stats.maxGap / 1000).toFixed(1) + " s" : "–";
+    $("s-wakes").textContent = stats.wakes;
+    $("s-vis").textContent = document.visibilityState + (document.hasFocus() ? "·focus" : "");
+  }
+
+  // ---- the thing under test
+  async function postMessageToChat(text, why) {
+    const t0 = performance.now();
+    const meta = { why, visibility: document.visibilityState, focused: document.hasFocus(), userActivation: navigator.userActivation ? navigator.userActivation.isActive : null };
+    try {
+      let result;
+      if (hostCaps.message || !window.openai) {
+        result = await request("ui/message", { role: "user", content: [{ type: "text", text }] }, 60000);
+      } else {
+        result = await window.openai.sendFollowUpMessage({ prompt: text });
+      }
+      const ok = !(result && result.isError);
+      return { ok, ms: Math.round(performance.now() - t0), result, ...meta };
+    } catch (e) {
+      return { ok: false, ms: Math.round(performance.now() - t0), error: String(e.message || e), ...meta };
+    }
+  }
+
+  async function wake(id, from) {
+    const claim = await tool("bridge_claim", { widgetId, id });
+    if (!claim.ok) return log(`skip ${id}: ${claim.reason}`);
+    log(`waking chat for ${id} from ${from}…`);
+    const r = await postMessageToChat(
+      `[PEER-BRIDGE] New message ${id} from ${from} is waiting. Call bridge_receive to read it, then act on it per the bridge task.`,
+      "auto",
+    );
+    stats.wakes++;
+    log(r.ok ? `ui/message ok (${r.ms} ms, ${r.visibility})` : `ui/message FAILED: ${r.error || JSON.stringify(r.result)}`, r.ok ? "ok" : "bad");
+    await report("wake-result", { id, ...r });
+  }
+
+  async function pollLoop() {
+    if (stopped) return;
+    const now = Date.now();
+    const gapMs = lastPollAt ? now - lastPollAt : 0;
+    lastPollAt = now;
+    if (gapMs > stats.maxGap) stats.maxGap = gapMs;
+    if (gapMs > POLL_MS * 3) log(`poll gap ${(gapMs / 1000).toFixed(1)} s (throttled?)`, "warn");
+    try {
+      const r = await tool("bridge_poll", { widgetId, visibility: document.visibilityState, focused: document.hasFocus(), gapMs, host: hostName });
+      stats.polls++;
+      if (r.side && side !== r.side) { side = r.side; renderWho(); }
+      if ($("auto").checked) for (const p of r.pending) await wake(p.id, p.from);
+    } catch (e) {
+      log("poll failed: " + e.message, "bad");
+    }
+    renderStats();
+    setTimeout(pollLoop, POLL_MS);
+  }
+
+  $("btn-now").onclick = async () => {
+    const r = await postMessageToChat("[PEER-BRIDGE TEST] Manual ui/message from the bridge panel (after a click). Reply with just: ok", "manual-click");
+    log(r.ok ? `manual ui/message ok (${r.ms} ms)` : `manual ui/message FAILED: ${r.error || JSON.stringify(r.result)}`, r.ok ? "ok" : "bad");
+    report("manual-test", r);
+  };
+  $("btn-delay").onclick = () => {
+    log("delayed test fires in 15 s — switch chat / minimize now", "warn");
+    setTimeout(async () => {
+      const r = await postMessageToChat("[PEER-BRIDGE TEST] Delayed ui/message without a click. Reply with just: ok", "delayed-no-click");
+      log(r.ok ? `delayed ui/message ok (${r.ms} ms, ${r.visibility})` : `delayed ui/message FAILED: ${r.error || JSON.stringify(r.result)}`, r.ok ? "ok" : "bad");
+      report("delayed-test", r);
+    }, 15000);
+  };
+  document.addEventListener("visibilitychange", () => {
+    log("visibility → " + document.visibilityState);
+    report("visibility", { state: document.visibilityState });
+    renderStats();
+  });
+
+  (async () => {
+    try {
+      const init = await request("ui/initialize", {
+        appInfo: { name: "peer-bridge-panel", version: "0.1.0" },
+        appCapabilities: {},
+        protocolVersion: "2026-01-26",
+      });
+      hostName = (init.hostInfo && `${init.hostInfo.name} ${init.hostInfo.version || ""}`.trim()) || "unknown";
+      hostCaps = init.hostCapabilities || {};
+      const theme = init.hostContext && init.hostContext.theme;
+      if (theme) document.documentElement.setAttribute("data-theme", theme);
+      notify("ui/notifications/initialized");
+      log("initialized with " + hostName, "ok");
+      renderWho(); renderCaps(); resize();
+      report("init", { hostInfo: init.hostInfo, hostCapabilities: hostCaps, protocolVersion: init.protocolVersion, displayMode: init.hostContext && init.hostContext.displayMode, platform: init.hostContext && init.hostContext.platform, openai: !!window.openai });
+      pollLoop();
+    } catch (e) {
+      log("ui/initialize failed: " + e.message + (window.openai ? " (window.openai present)" : ""), "bad");
+      renderCaps();
+    }
+  })();
+})();
+</script>
+</body>
+</html>

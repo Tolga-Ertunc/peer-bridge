@@ -1,0 +1,6 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    { "name": "dev-host-claude", "runtimeExecutable": "node", "runtimeArgs": ["scripts/dev-host.mjs", "--side", "claude"], "port": 7460 }
+  ]
+}

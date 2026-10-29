@@ -1,0 +1,31 @@
+{
+  "name": "peer-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Let Claude Code (Claude Desktop) and ChatGPT Desktop review each other: an advisor chat in one app checks every turn of a primary chat in the other.",
+  "type": "module",
+  "scripts": {
+    "smoke": "node scripts/smoke.mjs",
+    "report": "node scripts/report.mjs",
+    "test:link": "node scripts/test-link.mjs",
+    "test:install": "node scripts/test-install.mjs",
+    "test": "node scripts/smoke.mjs && node scripts/test-link.mjs && node scripts/test-install.mjs"
+  },
+  "keywords": [
+    "mcp",
+    "claude-code",
+    "codex",
+    "chatgpt",
+    "code-review",
+    "agents"
+  ],
+  "author": "Tolga Ertunc",
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "zod": "^4.6.7"
+  }
+}
