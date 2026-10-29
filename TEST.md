@@ -293,3 +293,16 @@ Kullanıcı `bridge_review` ile `9deb2be`'yi yeni bir ChatGPT thread'inde (gpt-6
 - P2 one-off review diff'i: Claude'da oturumun `CLAUDE_PROJECT_DIR`'ı; ChatGPT'de paylaşılan sunucunun cwd'si asla kullanılmıyor, klasör bilinmiyorsa diff eklenmiyor ve bu açıkça yazılıyor (smoke 5c). `x-codex-turn-metadata` alanlarının adları `bridge_status`'ta görünüyor, içinde cwd varsa kullanılacak.
 - P2 `bridge_send` kimseyi uyandırmıyordu: artık son aktif bağlantının diğer ucuna hedefli mesaj (uyandırır), bağlantı yoksa reddedilir (smoke 5b).
 - Ek: yeni ChatGPT thread'leri için `effort` (config override + `thread/settings/update`); canlı doğrulandı, masaüstü uygulamasının turunda `"effort":"low"`.
+
+## Kapalı uygulamada wake (W1) — 2026-10-29 14:30 UTC
+
+ChatGPT Desktop tamamen kapalıyken (çalışan tek süreç `codex-windows-sandbox-service`) Luna thread'ine kuyruktan prompt eklendi ve `codex://threads/wake/<id>` açıldı:
+
+| t | olay |
+|---|---|
+| +0,4 sn | kuyruğa eklendi, wake linki açıldı |
+| +3 sn | ChatGPT süreçleri başladı (6, sonra 8) |
+| +5 sn | kuyruk boşaldı |
+| ~+10 sn | tur bitti: "kapalıyken ok" |
+
+Görünür pencere açılmadı (`MainWindowHandle` olan süreç 0): uygulama wake-only modda arka planda açılıp turu çalıştırdı. Sonuç: ChatGPT tarafı uygulama kapalıyken de uyandırılabiliyor; uygulama bundan sonra arka planda açık kalıyor.
