@@ -92,6 +92,22 @@ On Windows, Codex hooks get a PowerShell-safe command.
 
 Restart both apps afterwards. Hooks point at this checkout, so re-run the installer if you move it.
 
+ChatGPT Desktop reads hooks only when it starts. It also skips a new or changed hook until that hook is trusted, and it does this without any warning. After installing or updating, restart ChatGPT normally, with its window open. Then check:
+
+```bash
+npm run doctor
+```
+
+`doctor` reads everything and changes nothing. It checks:
+
+- Node and git;
+- the broker, and requests from hooks that are waiting;
+- the MCP registration, tool permissions and every hook on both sides, including Codex's own view of whether each hook is trusted, and whether the hook commands actually run;
+- the queue API in the installed ChatGPT version;
+- active links: failed deliveries, and Claude sessions that aren't listening.
+
+Each problem comes with the fix.
+
 ## Known limits
 
 - A Claude Code session can only be woken while it is open in Claude Desktop. Reviews for a closed advisor session wait until it opens, and the primary is told.
@@ -109,6 +125,7 @@ npm test
 - `scripts/smoke.mjs`: end to end over MCP with two real server processes, the hooks, and a throwaway git repo.
 - `scripts/test-link.mjs`: links, reviews, hooks, error notes, pruning and broker ownership handover.
 - `scripts/test-install.mjs`: install, reinstall and uninstall against throwaway config directories.
+- `scripts/test-doctor.mjs`: doctor reports a missing install, and catches Codex hooks that are installed but not trusted.
 
 ## Repository layout
 
@@ -121,7 +138,7 @@ npm test
   - `caller.mjs`: caller identity.
   - `platform.mjs`: OS paths.
 - `scripts/`
-  - `install.mjs`
+  - `install.mjs`, `doctor.mjs`
   - the tests
   - `send.mjs`, `codex-thread.mjs`: debugging helpers.
 - `TEST.md`: lab notebook (in Turkish) with the experiments and measurements behind this design.
