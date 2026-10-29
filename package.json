@@ -6,7 +6,6 @@
   "type": "module",
   "scripts": {
     "smoke": "node scripts/smoke.mjs",
-    "report": "node scripts/report.mjs",
     "test:link": "node scripts/test-link.mjs",
     "test:install": "node scripts/test-install.mjs",
     "test": "node scripts/smoke.mjs && node scripts/test-link.mjs && node scripts/test-install.mjs"

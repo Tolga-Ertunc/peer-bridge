@@ -270,3 +270,12 @@ Düzeltme: Codex girdisine Windows'ta `commandWindows` eklendi: node'un 8.3 kıs
 
 Eksik: inceleme isteğinde sadece primary'nin son mesajı var; kullanıcının sorusu yok ("37" tek başına değerlendirilemiyor, advisor soruyu thread kaydından okumak zorunda kaldı).
 - **Düzeltildi:** `UserPromptSubmit` hook'u bağlı primary'nin kullanıcı mesajını `turn_start` olarak kaydediyor; broker bunu aynı turun inceleme isteğine "User's message / Primary's final message" olarak ekliyor. Soru sadece kendi turuna eklenir (turn kimlikleri uyuşmazsa "(not captured)"), kullanıldıktan sonra silinir. Codex `turn_id`, Claude `prompt_id` kullanıyor. Testler: senaryo 2, 6 ve 6b. Broker protokolü 3'e çıktı.
+
+## Alfa turu — 2026-10-29
+
+- **Sınır ve büyüme:** 200 mesaj sınırı kaldırıldı (250 inceleme isteği testi). Durum budanıyor: okunmuş mesaj ve teslim edilmiş not 1 gün, her şey 7 gün, kapalı bağlantı 7 gün sonra; bağlantı başına son 50 tavsiye. Serbest `bridge_send` için döngü koruması: 10 dk'da 60 mesaj.
+- **Hatalar görünür:** ChatGPT'ye teslim başarısız olursa, ya da Claude advisor oturumu dinlemiyorsa, bekleyen chate bir sonraki prompt'unda "Bridge status" notu düşüyor; `bridge_status` bağlantı sağlığını ve dinleme durumunu gösteriyor.
+- **Diff:** `UserPromptSubmit` turun başında `git stash create` ile anlık görüntü alıyor (dosya/ref/index'e dokunmadan); `Stop` o görüntüye göre diff + yeni izlenmeyen dosyaları ekliyor (20k karakter sınırı). `.env*`, anahtar/sertifika, `*secret*`, `*credential*` ne içerik ne ad olarak gidiyor (smoke testi `.env` adının da sızdığını yakaladı, düzeltildi).
+- **Tek seferlik reviewer:** `bridge_review` (Claude'dan yeni ChatGPT thread'i + model, ya da her iki uygulamada join kodu). Cevap her severity'de geri gelir, bağlantı kapanır; kapanan bağlantıya rağmen cevap dinleyiciyi uyandırır (yarış durumu düzeltildi).
+- **Temizlik:** MCP Apps paneli (`bridge_join`, widget, poll/claim) ve uyandırma deneyi script'leri kaldırıldı (git geçmişinde duruyor). Smoke testi MCP üzerinden iki gerçek sunucuyla baştan yazıldı. Broker protokolü 4.
+- **Lisans:** kullanıcı kararıyla yok (tüm hakları saklı).

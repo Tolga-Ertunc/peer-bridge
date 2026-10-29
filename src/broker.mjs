@@ -21,21 +21,27 @@ export const STATE_FILE = path.join(DATA_DIR, "state.json");
 export const EVENTS_FILE = path.join(DATA_DIR, "events.jsonl");
 export const OUTBOX_DIR = path.join(DATA_DIR, "outbox");
 export const LISTENERS_DIR = path.join(DATA_DIR, "listeners");
+export const TURNS_DIR = path.join(DATA_DIR, "turns"); // per-chat turn baseline (git) for diffs
 const TOKEN_FILE = path.join(DATA_DIR, "token");
 const PORT = Number(process.env.PEER_BRIDGE_PORT || 7457);
 // Bumped whenever ops change. An owner running older code (a long-lived helper
 // left over from before an update) steps down when a newer client calls.
-export const PROTOCOL = Number(process.env.PEER_BRIDGE_TEST_PROTOCOL || 3);
+export const PROTOCOL = Number(process.env.PEER_BRIDGE_TEST_PROTOCOL || 4);
 
 export const SIDES = ["claude", "openai"];
-const MAX_MESSAGES_PER_RUN = 200; // runaway-loop guard
-const MAX_TEXT = 20_000;
-const CLAIM_TTL_MS = 30_000;
+const MAX_TEXT = 40_000;
+const MAX_PROMPT = 6_000;
+const MAX_ANSWER = 10_000;
+export const MAX_DIFF = 20_000;
 const SEVERITIES = ["none", "nit", "concern", "blocker"];
+const DAY = 24 * 3600_000;
+// free-form peer messages (bridge_send) can ping-pong; links can't
+const PEER_BURST = { count: 60, windowMs: 10 * 60_000 };
 
-for (const d of [DATA_DIR, OUTBOX_DIR, LISTENERS_DIR]) fs.mkdirSync(d, { recursive: true });
+for (const d of [DATA_DIR, OUTBOX_DIR, LISTENERS_DIR, TURNS_DIR]) fs.mkdirSync(d, { recursive: true });
 
 const sameEndpoint = (a, b) => !!a && !!b && a.app === b.app && a.id === b.id;
+const safeName = (endpoint) => `${endpoint.app}-${endpoint.id.replace(/[^\w.-]/g, "_")}`;
 
 // Read-only view of the broker state for hooks (no broker process needed)
 export function readState() {
@@ -61,8 +67,10 @@ export function pendingFor(state, endpoint) {
   return (state?.messages ?? []).filter((m) => sameEndpoint(m.toEndpoint, endpoint) && !m.readAt && (m.wakes ?? 0) < 2);
 }
 
+export const listenerFile = (endpoint) => path.join(LISTENERS_DIR, `${safeName(endpoint)}.json`);
+export const turnFile = (endpoint) => path.join(TURNS_DIR, `${safeName(endpoint)}.json`);
+
 const OUTBOX_OPS = new Set(["turn_start", "turn_end", "notes_ack", "wake_ack"]);
-const MAX_PROMPT = 8_000;
 
 function token() {
   try {
@@ -75,14 +83,12 @@ function token() {
 }
 
 function freshState() {
-  return { runId: "r" + Date.now().toString(36), seq: 0, messages: [], widgets: {}, links: {}, linkSeq: 0, notes: [] };
+  return { seq: 0, messages: [], links: {}, linkSeq: 0, notes: [] };
 }
 
 function logEvent(event) {
   fs.appendFileSync(EVENTS_FILE, JSON.stringify({ ts: new Date().toISOString(), ...event }) + "\n");
 }
-
-export const listenerFile = (endpoint) => path.join(LISTENERS_DIR, `${endpoint.app}-${endpoint.id.replace(/[^\w.-]/g, "_")}.json`);
 
 function listenerAlive(endpoint) {
   try {
@@ -94,22 +100,35 @@ function listenerAlive(endpoint) {
 }
 
 // What the woken chat sees; self-contained so it works after compaction
-function wakeText(m) {
+export function wakeText(m) {
   if (m.kind === "review-request")
-    return `[PEER-BRIDGE] Review request ${m.id} (link ${m.linkId}) from ${m.from} is waiting. Call bridge_receive to read it, review it as this link's advisor, then call bridge_advise with your verdict.`;
+    return `[PEER-BRIDGE] Review request ${m.id} (link ${m.linkId}) from ${m.from} is waiting. Call bridge_receive to read it, review it, then call bridge_advise with your verdict.`;
   if (m.kind === "advisory")
     return `[PEER-BRIDGE] Your advisor (${m.from}) flagged your last turn: ${m.id} (link ${m.linkId}). Call bridge_receive to read it, then address it or explain why not.`;
+  if (m.kind === "review-result")
+    return `[PEER-BRIDGE] The review you asked for is ready: ${m.id} (link ${m.linkId}) from ${m.from}. Call bridge_receive to read it.`;
   return `[PEER-BRIDGE] New message ${m.id} from ${m.from} is waiting. Call bridge_receive to read it, then act on it per the bridge task.`;
 }
-export { wakeText };
 
 async function deliverToCodex(threadId, text) {
   if (process.env.PEER_BRIDGE_FAKE_CODEX) {
+    if (process.env.PEER_BRIDGE_FAKE_CODEX === "fail") throw new Error("ChatGPT Desktop not reachable (test)");
     logEvent({ op: "fake-codex-deliver", threadId, text });
     return;
   }
   const { sendToThread } = await import("./codex.mjs");
   await sendToThread(threadId, text);
+}
+
+function reviewText({ heading, prompt, answer, diff }) {
+  return [
+    heading,
+    prompt !== undefined && `User's message:\n${prompt?.trim() || "(not captured)"}`,
+    answer !== undefined && `Primary's final message:\n${(answer?.trim() || "(no text)").slice(0, MAX_ANSWER)}`,
+    diff && `Changes in the working tree during this turn:\n${diff.slice(0, MAX_DIFF)}`,
+  ]
+    .filter(Boolean)
+    .join("\n\n");
 }
 
 // ---------------------------------------------------------------- owner side
@@ -121,9 +140,24 @@ class BrokerState {
     } catch {
       this.s = freshState();
     }
+    delete this.s.widgets; // left over from the MCP Apps panel spike
+  }
+
+  // Bounded state: read messages and delivered notes go after a day, anything
+  // after a week; closed links after a week; a link keeps its last 50 advisories
+  prune() {
+    const s = this.s;
+    const now = Date.now();
+    s.messages = s.messages.filter((m) => !(m.readAt && now - m.readAt > DAY) && now - m.ts < 7 * DAY).slice(-500);
+    s.notes = s.notes.filter((n) => !(n.deliveredAt && now - n.deliveredAt > DAY) && now - n.at < 7 * DAY);
+    for (const [id, l] of Object.entries(s.links)) {
+      if (!l.active && now - (l.closedAt ?? l.createdAt) > 7 * DAY) delete s.links[id];
+      else l.advisories = (l.advisories ?? []).slice(-50);
+    }
   }
 
   save() {
+    this.prune();
     const tmp = STATE_FILE + ".tmp";
     fs.writeFileSync(tmp, JSON.stringify(this.s, null, 2));
     fs.renameSync(tmp, STATE_FILE);
@@ -170,11 +204,13 @@ class BrokerState {
       deliverToCodex(m.toEndpoint.id, wakeText(m)).then(
         () => {
           m.dispatch = { state: "sent", at: Date.now() };
+          this.health(m, true);
           logEvent({ op: "dispatch", id: m.id, to: m.toEndpoint, ok: true });
           this.save();
         },
         (e) => {
           m.dispatch = { state: "error", at: Date.now(), error: String(e.message || e) };
+          this.health(m, false, m.dispatch.error);
           logEvent({ op: "dispatch", id: m.id, to: m.toEndpoint, ok: false, error: m.dispatch.error });
           this.save();
         },
@@ -182,40 +218,81 @@ class BrokerState {
     }
   }
 
-  op_status() {
+  // Delivery outcome per link; failures reach the chat that is waiting on it
+  health(m, ok, error) {
+    const link = this.s.links[m.linkId];
+    if (!link) return;
+    link.health = { at: Date.now(), ok, ...(error && { error, message: m.id }) };
+    if (ok) return;
+    const waiting = m.kind === "review-request" ? link.primary : link.advisor;
+    this.bridgeNote(link, waiting, `delivery:${m.kind}`, `Couldn't hand ${m.kind} ${m.id} to the ChatGPT thread ${m.toEndpoint.id}: ${error}. Is ChatGPT Desktop installed and signed in?`);
+  }
+
+  // Status notes from the bridge itself, shown with the chat's next prompt;
+  // one per key until delivered
+  bridgeNote(link, to, key, text) {
+    if (!to) return;
+    const fullKey = `${link.id}:${key}`;
+    if (this.s.notes.some((n) => n.key === fullKey && !n.deliveredAt)) return;
+    this.s.notes.push({ id: "n" + ++this.s.seq, linkId: link.id, to, kind: "bridge", key: fullKey, text, at: Date.now(), deliveredAt: null });
+  }
+
+  op_status({ endpoint } = {}) {
     const s = this.s;
+    const mine = (l) => !endpoint || sameEndpoint(l.primary, endpoint) || sameEndpoint(l.advisor, endpoint);
     return {
-      runId: s.runId,
       messages: s.messages.length,
-      maxMessages: MAX_MESSAGES_PER_RUN,
       unread: Object.fromEntries(SIDES.map((x) => [x, s.messages.filter((m) => m.to === x && !m.readAt).length])),
-      links: Object.values(s.links).map((l) => ({
-        ...l,
-        advisories: l.advisories?.length ?? 0,
-        // Claude endpoints need a live listener hook to be woken
-        listening: Object.fromEntries(
-          ["primary", "advisor"].filter((r) => l[r]?.app === "claude").map((r) => [r, !!listenerAlive(l[r])]),
-        ),
-      })),
-      widgets: Object.entries(s.widgets).map(([id, w]) => ({ id, ...w })),
+      links: Object.values(s.links)
+        .filter(mine)
+        .map(({ advisories, lastPrompt, request, ...l }) => ({
+          ...l,
+          advisories: advisories?.length ?? 0,
+          lastAdvice: advisories?.at(-1) ?? null,
+          // Claude endpoints need a live listener hook to be woken
+          listening: Object.fromEntries(["primary", "advisor"].filter((r) => l[r]?.app === "claude").map((r) => [r, !!listenerAlive(l[r])])),
+        })),
+      pendingNotes: s.notes.filter((n) => !n.deliveredAt && (!endpoint || sameEndpoint(n.to, endpoint))).length,
     };
+  }
+
+  op_ping() {
+    return { pid: process.pid, protocol: PROTOCOL };
+  }
+
+  op_reset() {
+    this.s = freshState();
+    logEvent({ op: "reset" });
+    return { ok: true };
+  }
+
+  // Telemetry only (server start, caller identity)
+  op_report({ side, event, data }) {
+    logEvent({ op: "report", side, event, data });
+    return { ok: true };
   }
 
   // ------------------------------------------------------------- links
 
-  linkFor(role, endpoint) {
-    return Object.values(this.s.links).find((l) => l.active && sameEndpoint(l[role], endpoint));
+  linkFor(role, endpoint, mode) {
+    return Object.values(this.s.links).find((l) => l.active && sameEndpoint(l[role], endpoint) && (!mode || l.mode === mode));
   }
 
-  // One active link per primary; advisor may be bound now or later via join code
-  op_link_create({ primary, advisor, mode = "advisor", name }) {
+  // mode "advisor": every turn of the primary is reviewed; one per primary.
+  // mode "review": one request, one answer, then the link closes.
+  // The advisor is bound now (a thread the bridge created) or later via code.
+  op_link_create({ primary, advisor, mode = "advisor", name, request }) {
     if (!primary?.app || !primary?.id) throw new Error("primary endpoint unknown (caller identity missing)");
-    for (const l of Object.values(this.s.links)) if (l.active && sameEndpoint(l.primary, primary)) l.active = false;
+    if (mode === "advisor")
+      for (const l of Object.values(this.s.links))
+        if (l.active && l.mode === "advisor" && sameEndpoint(l.primary, primary)) Object.assign(l, { active: false, closedAt: Date.now() });
     const id = "L" + ++this.s.linkSeq;
     const link = { id, mode, name: name ?? null, active: true, createdAt: Date.now(), primary, advisor: advisor ?? null, reviews: 0, advisories: [] };
     if (!advisor) link.joinCode = crypto.randomBytes(3).toString("hex");
+    if (request) link.request = request.slice(0, MAX_TEXT - 500);
     this.s.links[id] = link;
-    logEvent({ op: "link_create", id, primary, advisor: advisor ?? null });
+    logEvent({ op: "link_create", id, mode, primary, advisor: advisor ?? null });
+    if (advisor) this.sendReviewRequest(link);
     return { id, joinCode: link.joinCode ?? null };
   }
 
@@ -226,7 +303,15 @@ class BrokerState {
     link.advisor = endpoint;
     delete link.joinCode;
     logEvent({ op: "link_join", id: link.id, advisor: endpoint });
-    return { id: link.id, primary: link.primary };
+    this.sendReviewRequest(link);
+    return { id: link.id, mode: link.mode, primary: link.primary };
+  }
+
+  // the one request of a "review" link, once its reviewer is known
+  sendReviewRequest(link) {
+    if (link.mode !== "review" || !link.request || !link.advisor) return;
+    this.post({ from: link.primary.app, toEndpoint: link.advisor, kind: "review-request", linkId: link.id, text: link.request });
+    delete link.request;
   }
 
   op_link_close({ endpoint, linkId }) {
@@ -234,7 +319,7 @@ class BrokerState {
     for (const l of Object.values(this.s.links)) {
       if (!l.active) continue;
       if (linkId ? l.id === linkId : sameEndpoint(l.primary, endpoint) || sameEndpoint(l.advisor, endpoint)) {
-        l.active = false;
+        Object.assign(l, { active: false, closedAt: Date.now() });
         closed.push(l.id);
       }
     }
@@ -244,7 +329,7 @@ class BrokerState {
 
   // From the primary's UserPromptSubmit hook: what the user asked this turn
   op_turn_start({ endpoint, turnId, prompt }) {
-    const link = this.linkFor("primary", endpoint);
+    const link = this.linkFor("primary", endpoint, "advisor");
     if (!link || typeof prompt !== "string") return { skipped: "no link" };
     link.lastPrompt = { turnId: turnId ?? null, text: prompt.slice(0, MAX_PROMPT), at: Date.now() };
     return { ok: true };
@@ -252,8 +337,8 @@ class BrokerState {
 
   // From the primary's Stop hook. A turn the advisor itself triggered is not
   // sent back for review (no advisor → primary → advisor cascade).
-  op_turn_end({ endpoint, turnId, lastMessage }) {
-    const link = this.linkFor("primary", endpoint);
+  op_turn_end({ endpoint, turnId, lastMessage, diff }) {
+    const link = this.linkFor("primary", endpoint, "advisor");
     if (!link?.advisor) return { skipped: link ? "advisor not joined" : "no link" };
     // a prompt belongs to this turn if the ids match, or if either side has none
     const p = link.lastPrompt;
@@ -265,31 +350,43 @@ class BrokerState {
       return { skipped: "advisory follow-up" };
     }
     link.reviews++;
-    const answer = (lastMessage?.trim() || "(no text)").slice(0, MAX_TEXT - MAX_PROMPT - 500);
-    const text =
-      `Primary (${endpoint.app}) finished a turn${turnId ? ` (${turnId})` : ""}.\n\n` +
-      `User's message:\n${prompt?.trim() || "(not captured)"}\n\n` +
-      `Primary's final message:\n${answer}`;
+    if (link.advisor.app === "claude" && !listenerAlive(link.advisor))
+      this.bridgeNote(
+        link,
+        link.primary,
+        "advisor-offline",
+        `Your advisor (Claude Code session ${link.advisor.id}) isn't listening, so reviews are waiting. Open that session in Claude Desktop; it picks them up when it starts.`,
+      );
+    const text = reviewText({ heading: `Primary (${endpoint.app}) finished a turn${turnId ? ` (${turnId})` : ""}.`, prompt, answer: lastMessage ?? "", diff });
     return this.post({ from: endpoint.app, toEndpoint: link.advisor, kind: "review-request", linkId: link.id, text });
   }
 
-  // From the advisor (bridge_advise). blocker/concern wake the primary once;
-  // nits wait for its next prompt; repeated notes are dropped.
+  // From the advisor (bridge_advise), for the review request it last read.
+  // Advisor mode: blocker/concern wake the primary once, nits wait for its
+  // next prompt, repeated notes are dropped. Review mode: the answer always
+  // goes back and the link closes.
   op_advise({ endpoint, verdict, severity, note, findings }) {
-    const link = this.linkFor("advisor", endpoint);
-    if (!link) throw new Error("this chat is not the advisor of an active link");
     if (!SEVERITIES.includes(severity)) throw new Error(`severity must be one of ${SEVERITIES.join("|")}`);
+    const req = this.s.messages.findLast((m) => m.kind === "review-request" && sameEndpoint(m.toEndpoint, endpoint) && m.readAt && !m.answeredAt);
+    const link = (req && this.s.links[req.linkId]?.active && this.s.links[req.linkId]) || this.linkFor("advisor", endpoint);
+    if (!link) throw new Error("this chat is not the advisor of an active link");
+    if (req) req.answeredAt = Date.now();
     const body = [note?.trim(), ...(findings ?? []).map((f) => `- ${typeof f === "string" ? f : JSON.stringify(f)}`)].filter(Boolean).join("\n");
+    const text = `Verdict: ${verdict ?? "-"} · severity: ${severity}\n\n${body || "(nothing to add)"}`;
+    if (link.mode === "review") {
+      link.advisories.push({ at: Date.now(), verdict, severity, body });
+      Object.assign(link, { active: false, closedAt: Date.now() });
+      return { delivered: "now", ...this.post({ from: endpoint.app, toEndpoint: link.primary, kind: "review-result", linkId: link.id, text }) };
+    }
     // empty "nothing to say" answers aren't repeats of each other
     const dup = !!body && link.advisories.some((a) => a.body === body && a.severity === severity);
     link.advisories.push({ at: Date.now(), verdict, severity, body, dup });
     if (dup || severity === "none" || !body) return { delivered: "none", dup };
     if (severity === "nit") {
-      this.s.notes.push({ id: "n" + ++this.s.seq, linkId: link.id, to: link.primary, text: body, at: Date.now(), deliveredAt: null });
+      this.s.notes.push({ id: "n" + ++this.s.seq, linkId: link.id, to: link.primary, kind: "advice", text: body, at: Date.now(), deliveredAt: null });
       return { delivered: "next prompt" };
     }
     link.awaitingAdvisoryTurn = true;
-    const text = `Verdict: ${verdict ?? "-"} · severity: ${severity}\n\n${body}`;
     return { delivered: "now", ...this.post({ from: endpoint.app, toEndpoint: link.primary, kind: "advisory", linkId: link.id, text }) };
   }
 
@@ -304,87 +401,35 @@ class BrokerState {
   }
 
   post({ from, toEndpoint, kind, linkId, text }) {
-    const s = this.s;
-    if (s.messages.length >= MAX_MESSAGES_PER_RUN)
-      throw new Error(`run ${s.runId} reached ${MAX_MESSAGES_PER_RUN} messages; reset the bridge to continue`);
-    const msg = { id: "m" + ++s.seq, from, to: toEndpoint.app, toEndpoint, kind, linkId, text, ts: Date.now(), readAt: null, claim: null, wake: null };
-    s.messages.push(msg);
-    logEvent({ op: "send", runId: s.runId, id: msg.id, from, to: toEndpoint, kind, linkId, len: text.length });
+    const msg = { id: "m" + ++this.s.seq, from, to: toEndpoint.app, toEndpoint, kind, linkId, text: text.slice(0, MAX_TEXT), ts: Date.now(), readAt: null };
+    this.s.messages.push(msg);
+    logEvent({ op: "send", id: msg.id, from, to: toEndpoint, kind, linkId, len: msg.text.length });
     return { id: msg.id };
   }
 
-  op_ping() {
-    return { pid: process.pid, protocol: PROTOCOL };
-  }
-
-  op_reset() {
-    this.s = freshState();
-    logEvent({ op: "reset", runId: this.s.runId });
-    return { runId: this.s.runId };
-  }
-
-  // `from` is fixed by the calling server process's --side, never by the model.
+  // Free-form peer message (bridge_send). `from` is fixed by the calling
+  // server's --side, never by the model.
   op_send({ from, to, text }) {
-    const s = this.s;
     if (!to) to = SIDES.find((x) => x !== from);
     if (!SIDES.includes(to)) throw new Error(`bad recipient: ${to}`);
     if (typeof text !== "string" || !text.trim()) throw new Error("empty message");
     if (text.length > MAX_TEXT) throw new Error(`message too long (${text.length} > ${MAX_TEXT})`);
-    if (s.messages.length >= MAX_MESSAGES_PER_RUN)
-      throw new Error(`run ${s.runId} reached ${MAX_MESSAGES_PER_RUN} messages; reset the bridge to continue`);
-    const msg = { id: "m" + ++s.seq, from, to, text, ts: Date.now(), readAt: null, claim: null, wake: null };
-    s.messages.push(msg);
-    logEvent({ op: "send", runId: s.runId, id: msg.id, from, to, len: text.length });
-    return { id: msg.id, step: s.messages.length, maxMessages: MAX_MESSAGES_PER_RUN };
+    const recent = this.s.messages.filter((m) => !m.kind && m.from === from && Date.now() - m.ts < PEER_BURST.windowMs).length;
+    if (recent >= PEER_BURST.count) throw new Error(`more than ${PEER_BURST.count} peer messages in 10 minutes; looks like a loop, wait a bit`);
+    const msg = { id: "m" + ++this.s.seq, from, to, text, ts: Date.now(), readAt: null };
+    this.s.messages.push(msg);
+    logEvent({ op: "send", id: msg.id, from, to, len: text.length });
+    return { id: msg.id };
   }
 
   // Messages for a specific chat only reach that chat; untargeted ones any
-  // chat of the side (the original peer mode)
+  // chat of the side
   op_receive({ side, endpoint }) {
     const now = Date.now();
     const out = this.s.messages.filter((m) => m.to === side && !m.readAt && (!m.toEndpoint || sameEndpoint(m.toEndpoint, endpoint)));
     for (const m of out) m.readAt = now;
     logEvent({ op: "receive", side, endpoint, ids: out.map((m) => m.id) });
-    return { runId: this.s.runId, messages: out.map(({ id, from, kind, linkId, text, ts }) => ({ id, from, kind, linkId, text, ts })) };
-  }
-
-  // Widget heartbeat + list of messages that still need a wake-up.
-  op_poll({ side, widgetId, visibility, focused, gapMs, host }) {
-    const now = Date.now();
-    const w = (this.s.widgets[widgetId] ??= { side, host, firstSeen: now, polls: 0 });
-    w.polls++;
-    w.lastPoll = now;
-    w.visibility = visibility;
-    w.focused = focused;
-    logEvent({ op: "poll", side, widgetId, visibility, focused, gapMs });
-    // chat-targeted messages have their own wake paths (queue / listener hook)
-    const pending = this.s.messages.filter(
-      (m) => m.to === side && !m.toEndpoint && !m.readAt && !m.wake?.ok && !(m.claim && now - m.claim.at < CLAIM_TTL_MS),
-    );
-    return { side, pending: pending.map((m) => ({ id: m.id, from: m.from })) };
-  }
-
-  // Lease so that only one widget per side fires ui/message for a given message.
-  op_claim({ side, widgetId, id }) {
-    const m = this.s.messages.find((x) => x.id === id && x.to === side);
-    const now = Date.now();
-    if (!m || m.readAt || m.wake?.ok) return { ok: false, reason: "not pending" };
-    if (m.claim && m.claim.widgetId !== widgetId && now - m.claim.at < CLAIM_TTL_MS)
-      return { ok: false, reason: "claimed by " + m.claim.widgetId };
-    m.claim = { widgetId, at: now };
-    logEvent({ op: "claim", side, widgetId, id });
-    return { ok: true, from: m.from };
-  }
-
-  // Free-form telemetry from widgets (init, ui/message results, visibility, teardown).
-  op_report({ side, widgetId, event, data }) {
-    if (event === "wake-result" && data?.id) {
-      const m = this.s.messages.find((x) => x.id === data.id);
-      if (m) m.wake = { widgetId, ok: !!data.ok, at: Date.now(), detail: data };
-    }
-    if (event === "init") (this.s.widgets[widgetId] ??= { side, firstSeen: Date.now(), polls: 0 }).init = data;
-    logEvent({ op: "report", side, widgetId, event, data });
-    return { ok: true };
+    return { messages: out.map(({ id, from, kind, linkId, text, ts }) => ({ id, from, kind, linkId, text, ts })) };
   }
 }
 

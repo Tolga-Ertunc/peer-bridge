@@ -1,69 +1,123 @@
-// Spawns two server processes (claude + openai) against a throwaway broker
-// and runs the whole message path the panels and models would use.
+// End to end over MCP: two real server processes (Claude side with a session
+// id in its env, ChatGPT side identified by _meta.threadId per call), the
+// hooks as subprocesses, a throwaway git repo for diffs, a throwaway broker.
+// Codex delivery is faked (PEER_BRIDGE_FAKE_CODEX).
 
 import os from "node:os";
 import fs from "node:fs";
 import path from "node:path";
 import assert from "node:assert/strict";
+import { spawn, execFileSync } from "node:child_process";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), "peer-bridge-smoke-"));
-const env = { ...process.env, PEER_BRIDGE_DIR: dir, PEER_BRIDGE_PORT: "7499" };
+const repo = fs.mkdtempSync(path.join(os.tmpdir(), "peer-bridge-repo-"));
+const env = { ...process.env, PEER_BRIDGE_DIR: dir, PEER_BRIDGE_PORT: "7496", PEER_BRIDGE_FAKE_CODEX: "1" };
 const server = path.resolve(import.meta.dirname, "../src/server.mjs");
+const hook = path.resolve(import.meta.dirname, "../src/hook.mjs");
+const SESSION = "claude-session-smoke";
+const THREAD = "gpt-thread-smoke";
+const REVIEWER = "gpt-thread-reviewer";
 
-async function connect(side) {
+const git = (...a) => execFileSync("git", ["-C", repo, "-c", "user.name=t", "-c", "user.email=t@t", ...a], { stdio: "ignore" });
+git("init", "-q");
+fs.writeFileSync(path.join(repo, "parser.js"), "export const parse = (s) => s.split(',');\n");
+git("add", ".");
+git("commit", "-q", "-m", "init");
+
+async function connect(side, extraEnv = {}) {
   const client = new Client({ name: `smoke-${side}`, version: "0" });
-  await client.connect(new StdioClientTransport({ command: process.execPath, args: [server, "--side", side], env, stderr: "ignore" }));
+  await client.connect(new StdioClientTransport({ command: process.execPath, args: [server, "--side", side], env: { ...env, ...extraEnv }, stderr: "ignore" }));
   return client;
 }
-const json = (r) => r.structuredContent ?? JSON.parse(r.content[0].text);
-const call = (c, name, args = {}) => c.callTool({ name, arguments: args });
+const call = async (c, name, args = {}, meta) => {
+  const r = await c.callTool({ name, arguments: args, ...(meta && { _meta: meta }) });
+  assert.ok(!r.isError, `${name} failed: ${r.content?.[0]?.text}`);
+  return r;
+};
+const textOf = (r) => r.content.map((c) => c.text).join("\n");
+const asGpt = (threadId) => ({ threadId, sessionId: threadId });
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+function runHook(app, event, input) {
+  return new Promise((resolve) => {
+    const p = spawn(process.execPath, [hook, "--app", app, "--event", event], { env });
+    let out = "";
+    p.stdout.on("data", (d) => (out += d));
+    p.on("close", (code) => resolve({ code, out }));
+    p.stdin.end(JSON.stringify({ hook_event_name: event, cwd: repo, ...input }));
+  });
+}
+async function receiveUntil(c, meta, re) {
+  for (let i = 0; i < 40; i++) {
+    const t = textOf(await call(c, "bridge_receive", {}, meta));
+    if (re.test(t)) return t;
+    await sleep(100);
+  }
+  throw new Error(`no message matching ${re}`);
+}
 
-const claude = await connect("claude");
+const claude = await connect("claude", { CLAUDE_CODE_SESSION_ID: SESSION, CLAUDE_PROJECT_DIR: repo });
 const openai = await connect("openai");
 
-const { tools } = await claude.listTools();
-const join = tools.find((t) => t.name === "bridge_join");
-assert.equal(join._meta.ui.resourceUri, "ui://peer-bridge/panel.html");
-assert.deepEqual(tools.find((t) => t.name === "bridge_poll")._meta.ui.visibility, ["app"]);
+// 1. tools and their approval hints
+const expected = ["bridge_advise", "bridge_link", "bridge_link_join", "bridge_receive", "bridge_review", "bridge_send", "bridge_status", "bridge_unlink"];
+for (const c of [claude, openai]) {
+  const { tools } = await c.listTools();
+  assert.deepEqual(tools.map((t) => t.name).sort(), expected);
+  for (const t of tools) assert.equal(t.annotations?.destructiveHint, false, `${t.name} must be marked non-destructive`);
+}
+console.log("1 both servers expose the same 8 tools, all marked non-destructive");
 
-const res = await claude.readResource({ uri: "ui://peer-bridge/panel.html" });
-assert.equal(res.contents[0].mimeType, "text/html;profile=mcp-app");
-assert.match(res.contents[0].text, /ui\/message/);
+// 2. Claude primary, ChatGPT advisor via join code; identity from env / _meta
+const link = (await call(claude, "bridge_link", { advisor: "join" })).structuredContent;
+assert.match(link.joinCode, /^[0-9a-f]{6}$/);
+assert.match(textOf(await call(openai, "bridge_link_join", { code: link.joinCode }, asGpt(THREAD))), /Joined link L\d+ as advisor of claude chat claude-session-smoke/);
+console.log(`2 link ${link.id}: Claude session (env) ↔ ChatGPT thread (_meta)`);
 
-assert.equal(json(await call(claude, "bridge_join")).side, "claude");
+// 3. a turn: prompt hook snapshots the tree, the turn edits files, Stop sends question + answer + diff
+await runHook("claude", "prompt", { session_id: SESSION, prompt_id: "p1", prompt: "Make parse trim whitespace." });
+fs.writeFileSync(path.join(repo, "parser.js"), "export const parse = (s) => s.split(',').map((x) => x.trim());\n");
+fs.writeFileSync(path.join(repo, ".env"), "API_KEY=super-secret\n");
+fs.writeFileSync(path.join(repo, "notes.md"), "new file\n");
+const stop = await runHook("claude", "stop", { session_id: SESSION, prompt_id: "p1", last_assistant_message: "parse now trims each field." });
+assert.equal(stop.code, 0);
+assert.equal(stop.out, "");
+const req = await receiveUntil(openai, asGpt(THREAD), /kind=review-request/);
+assert.match(req, /User's message:\nMake parse trim whitespace\./);
+assert.match(req, /Primary's final message:\nparse now trims each field\./);
+assert.match(req, /\+export const parse = \(s\) => s\.split\(','\)\.map\(\(x\) => x\.trim\(\)\);/);
+assert.match(req, /New untracked files:\nnotes\.md/);
+assert.doesNotMatch(req, /super-secret|\.env/, "secret files must never be sent");
+console.log("3 review request carries the question, the answer and the turn's diff; .env left out");
 
-// openai panel heartbeat, nothing pending yet
-const first = json(await call(openai, "bridge_poll", { widgetId: "wA", visibility: "visible" }));
-assert.equal(first.side, "openai");
-assert.deepEqual(first.pending, []);
+// 4. advisor raises a concern → Claude gets it
+await call(openai, "bridge_advise", { verdict: "incorrect", severity: "concern", note: "Empty fields are kept; filter them out?" }, asGpt(THREAD));
+assert.match(await receiveUntil(claude, undefined, /kind=advisory/), /Empty fields are kept/);
+console.log("4 concern delivered to the Claude primary");
 
-// claude model sends; broker stamps from=claude
-await call(claude, "bridge_send", { text: "please review: 2+2=5" });
-const polled = json(await call(openai, "bridge_poll", { widgetId: "wA" }));
-assert.deepEqual(polled.pending, [{ id: "m1", from: "claude" }]);
+// 5. one-off review from Claude, reviewer joins from ChatGPT, answer comes back, link closes
+const rev = (await call(claude, "bridge_review", { reviewer: "join", request: "Is the trim change safe for quoted CSV?" })).structuredContent;
+assert.match(textOf(await call(openai, "bridge_link_join", { code: rev.joinCode }, asGpt(REVIEWER))), /Its request is waiting/);
+const revReq = await receiveUntil(openai, asGpt(REVIEWER), /kind=review-request/);
+assert.match(revReq, /Is the trim change safe for quoted CSV\?/);
+assert.match(revReq, /Uncommitted changes in .*:/);
+assert.doesNotMatch(revReq, /super-secret/);
+await call(openai, "bridge_advise", { verdict: "unclear", severity: "nit", note: "Quoted fields with commas will still split." }, asGpt(REVIEWER));
+assert.match(await receiveUntil(claude, undefined, /kind=review-result/), /Quoted fields with commas/);
+const status = JSON.parse(textOf(await call(claude, "bridge_status")));
+assert.equal(status.chat.id, SESSION);
+assert.equal(status.links.find((l) => l.id === rev.id).active, false, "one-off review link closes after its answer");
+console.log(`5 one-off review ${rev.id}: request with diff → answer back → link closed`);
 
-// two panels race for the same wake-up: only one wins
-assert.equal(json(await call(openai, "bridge_claim", { widgetId: "wA", id: "m1" })).ok, true);
-assert.equal(json(await call(openai, "bridge_claim", { widgetId: "wB", id: "m1" })).ok, false);
-assert.deepEqual(json(await call(openai, "bridge_poll", { widgetId: "wB" })).pending, []);
-await call(openai, "bridge_report", { widgetId: "wA", event: "wake-result", data: { id: "m1", ok: true, ms: 12 } });
+// 6. status from the ChatGPT side knows its own chat; unlink ends reviews
+const gptStatus = JSON.parse(textOf(await call(openai, "bridge_status", {}, asGpt(THREAD))));
+assert.equal(gptStatus.chat.id, THREAD);
+assert.ok(gptStatus.links.some((l) => l.id === link.id && l.active));
+assert.match(textOf(await call(claude, "bridge_unlink")), new RegExp(`Closed ${link.id}`));
+console.log("6 status is per chat; unlink closes the link");
 
-// openai model reads it, wrapped in the envelope
-const recv = (await call(openai, "bridge_receive")).content[0].text;
-assert.match(recv, /\[PEER from=claude id=m1 run=r\w+\]\nplease review: 2\+2=5\n\[\/PEER\]/);
-assert.match((await call(openai, "bridge_receive")).content[0].text, /No unread/);
-
-// reply goes back to claude
-await call(openai, "bridge_send", { text: "2+2=4" });
-assert.deepEqual(json(await call(claude, "bridge_poll", { widgetId: "wC" })).pending, [{ id: "m2", from: "openai" }]);
-
-// closing the owning process hands the broker to the survivor
 await claude.close();
-assert.match((await call(openai, "bridge_status")).content[0].text, /"messages": 2/);
-
 await openai.close();
-const events = fs.readFileSync(path.join(dir, "events.jsonl"), "utf8").trim().split("\n").map(JSON.parse);
-assert.ok(events.some((e) => e.event === "wake-result"));
-console.log(`smoke ok — ${events.length} events in ${dir}`);
+console.log(`smoke ok (${dir})`);
+process.exit(0);

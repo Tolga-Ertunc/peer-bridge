@@ -11,6 +11,7 @@ import { spawn } from "node:child_process";
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), "peer-bridge-link-"));
 Object.assign(process.env, { PEER_BRIDGE_DIR: dir, PEER_BRIDGE_PORT: "7498", PEER_BRIDGE_FAKE_CODEX: "1" });
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const sameTo = (a, b) => !!a && a.app === b.app && a.id === b.id;
 
 // 0. a stale owner (older protocol, e.g. a helper left over from before an
 // update) steps down when a newer client calls, and the client takes over
@@ -165,7 +166,53 @@ r = await runHook("claude", "listen", { session_id: CLAUDE2.id });
 assert.equal(r.code, 0);
 console.log(`8 after unlink the listener exits at once (${r.ms} ms)`);
 
-// 9. owner dies while idle: a surviving server's keepOwner ping takes over and
+// 10. a one-off review answer still wakes the requester, although its link
+// closes as the answer is posted
+{
+  const REQ = { app: "claude", id: "claude-requester" };
+  const REV = { app: "claude", id: "claude-reviewer" };
+  const rl = await call("link_create", { primary: REQ, mode: "review", advisor: REV, request: "Check the parser." });
+  const requester = runHook("claude", "listen", { session_id: REQ.id });
+  await sleep(1200);
+  const got = await call("receive", { side: "claude", endpoint: REV });
+  assert.match(got.messages[0].text, /Check the parser/);
+  await call("advise", { endpoint: REV, verdict: "correct", severity: "none", note: "" });
+  r = await requester;
+  assert.equal(r.code, 2);
+  assert.match(r.err, /review you asked for is ready/);
+  assert.equal(state().links[rl.id].active, false);
+  console.log("10 one-off review: answer woke the requester, link closed (even with severity none)");
+}
+
+// 11. Claude advisor not listening → the primary is told with its next prompt
+{
+  const P = { app: "openai", id: "gpt-primary-offline" };
+  const A = { app: "claude", id: "claude-advisor-offline" };
+  const l = await call("link_create", { primary: P });
+  await call("link_join", { code: l.joinCode, endpoint: A });
+  await runHook("openai", "stop", { session_id: P.id, turn_id: "x1", last_assistant_message: "done" });
+  await until(() => state().notes.some((n) => n.kind === "bridge" && sameTo(n.to, P)));
+  r = await runHook("openai", "prompt", { session_id: P.id, turn_id: "x2", prompt: "next" });
+  assert.match(JSON.parse(r.out).hookSpecificOutput.additionalContext, /isn't listening/);
+  await call("link_close", { linkId: l.id });
+  console.log("11 offline Claude advisor reported to the primary with its next prompt");
+}
+
+// 12. no message cap; old state is pruned
+{
+  const P = { app: "claude", id: "claude-bulk" };
+  const A = { app: "claude", id: "claude-bulk-advisor" };
+  await call("link_create", { primary: P, advisor: A });
+  for (let i = 0; i < 250; i++) await call("turn_end", { endpoint: P, turnId: `b${i}`, lastMessage: `turn ${i}` });
+  assert.ok(state().messages.filter((m) => sameTo(m.toEndpoint, A)).length >= 250, "250 review requests, no cap");
+  // age everything: read a day+ ago, or older than a week
+  const s = state();
+  for (const m of s.messages) m.ts = Date.now() - 8 * 24 * 3600_000;
+  fs.writeFileSync(path.join(dir, "state.json.aged"), JSON.stringify(s));
+  console.log(`12 250 review requests accepted (no cap); pruning checked below`);
+}
+
+// 14. owner dies while idle: a surviving server's keepOwner ping takes over and
 // ingests the hook's request (this process stops owning by exiting the child
 // test below, so run it on a fresh port + dir)
 {
@@ -189,7 +236,36 @@ console.log(`8 after unlink the listener exits at once (${r.ms} ms)`);
   while (!ev().includes('"kind":"review-request"') && Date.now() < end) await sleep(50);
   serverB.kill();
   assert.ok(ev().includes('"kind":"review-request"'), "surviving server must take over and ingest");
-  console.log(`9 owner died while idle: surviving server took over, request ingested in ${Date.now() - t0} ms`);
+  console.log(`14 owner died while idle: surviving server took over, request ingested in ${Date.now() - t0} ms`);
+}
+
+// 15. a failed ChatGPT delivery reaches the waiting primary, and an owner
+// loading week-old state prunes it (fresh broker so the failing fake applies)
+{
+  const dir3 = fs.mkdtempSync(path.join(os.tmpdir(), "peer-bridge-fail-"));
+  fs.copyFileSync(path.join(dir, "state.json.aged"), path.join(dir3, "state.json"));
+  const env3 = { ...process.env, PEER_BRIDGE_DIR: dir3, PEER_BRIDGE_PORT: "7495", PEER_BRIDGE_FAKE_CODEX: "fail" };
+  const P = { app: "claude", id: "claude-fail" };
+  const owner = spawn(process.execPath, ["--input-type=module", "-e",
+    `const b=await import(${JSON.stringify(brokerUrl)});await b.call("link_create",{primary:${JSON.stringify(P)},advisor:{app:"openai",id:"gpt-gone"}});console.log("ready");setInterval(()=>{},1000);`], { env: env3 });
+  await new Promise((r) => owner.stdout.once("data", r));
+  const st3 = () => JSON.parse(fs.readFileSync(path.join(dir3, "state.json"), "utf8"));
+  assert.ok(st3().messages.length < 10, `week-old messages pruned (left ${st3().messages.length})`);
+  const run3 = (event, input) =>
+    new Promise((resolve) => {
+      const p = spawn(process.execPath, [hook, "--app", "claude", "--event", event], { env: env3 });
+      let out = "";
+      p.stdout.on("data", (d) => (out += d));
+      p.on("close", () => resolve(out));
+      p.stdin.end(JSON.stringify({ session_id: P.id, cwd: ".", ...input }));
+    });
+  await run3("stop", { last_assistant_message: "x" });
+  const end = Date.now() + 4000;
+  while (!st3().notes.some((n) => n.kind === "bridge" && sameTo(n.to, P)) && Date.now() < end) await sleep(50);
+  const out = await run3("prompt", { prompt: "next" });
+  owner.kill();
+  assert.match(JSON.parse(out).hookSpecificOutput.additionalContext, /Couldn't hand review-request .* ChatGPT Desktop not reachable/);
+  console.log("15 failed delivery shown to the primary with its next prompt; week-old state pruned on load");
 }
 
 console.log("\nhooks log:\n" + fs.readFileSync(path.join(dir, "hooks.jsonl"), "utf8"));
