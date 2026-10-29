@@ -25,7 +25,7 @@ const TOKEN_FILE = path.join(DATA_DIR, "token");
 const PORT = Number(process.env.PEER_BRIDGE_PORT || 7457);
 // Bumped whenever ops change. An owner running older code (a long-lived helper
 // left over from before an update) steps down when a newer client calls.
-export const PROTOCOL = Number(process.env.PEER_BRIDGE_TEST_PROTOCOL || 2);
+export const PROTOCOL = Number(process.env.PEER_BRIDGE_TEST_PROTOCOL || 3);
 
 export const SIDES = ["claude", "openai"];
 const MAX_MESSAGES_PER_RUN = 200; // runaway-loop guard
@@ -61,7 +61,8 @@ export function pendingFor(state, endpoint) {
   return (state?.messages ?? []).filter((m) => sameEndpoint(m.toEndpoint, endpoint) && !m.readAt && (m.wakes ?? 0) < 2);
 }
 
-const OUTBOX_OPS = new Set(["turn_end", "notes_ack", "wake_ack"]);
+const OUTBOX_OPS = new Set(["turn_start", "turn_end", "notes_ack", "wake_ack"]);
+const MAX_PROMPT = 8_000;
 
 function token() {
   try {
@@ -241,20 +242,34 @@ class BrokerState {
     return { closed };
   }
 
+  // From the primary's UserPromptSubmit hook: what the user asked this turn
+  op_turn_start({ endpoint, turnId, prompt }) {
+    const link = this.linkFor("primary", endpoint);
+    if (!link || typeof prompt !== "string") return { skipped: "no link" };
+    link.lastPrompt = { turnId: turnId ?? null, text: prompt.slice(0, MAX_PROMPT), at: Date.now() };
+    return { ok: true };
+  }
+
   // From the primary's Stop hook. A turn the advisor itself triggered is not
   // sent back for review (no advisor → primary → advisor cascade).
   op_turn_end({ endpoint, turnId, lastMessage }) {
     const link = this.linkFor("primary", endpoint);
     if (!link?.advisor) return { skipped: link ? "advisor not joined" : "no link" };
+    // a prompt belongs to this turn if the ids match, or if either side has none
+    const p = link.lastPrompt;
+    const prompt = p && (!p.turnId || !turnId || p.turnId === turnId) ? p.text : null;
+    delete link.lastPrompt; // never attach an old question to a later turn
     if (link.awaitingAdvisoryTurn) {
       link.awaitingAdvisoryTurn = false;
       logEvent({ op: "turn_end", link: link.id, turnId, skipped: "advisory follow-up" });
       return { skipped: "advisory follow-up" };
     }
     link.reviews++;
+    const answer = (lastMessage?.trim() || "(no text)").slice(0, MAX_TEXT - MAX_PROMPT - 500);
     const text =
-      `Primary (${endpoint.app}) finished a turn${turnId ? ` (${turnId})` : ""}. Its final message:\n\n` +
-      (lastMessage?.trim() || "(no text)").slice(0, MAX_TEXT - 500);
+      `Primary (${endpoint.app}) finished a turn${turnId ? ` (${turnId})` : ""}.\n\n` +
+      `User's message:\n${prompt?.trim() || "(not captured)"}\n\n` +
+      `Primary's final message:\n${answer}`;
     return this.post({ from: endpoint.app, toEndpoint: link.advisor, kind: "review-request", linkId: link.id, text });
   }
 

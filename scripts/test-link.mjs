@@ -68,6 +68,8 @@ console.log(`1 unlinked: stop/listen exit 0 at once (${r.ms} ms)`);
 
 // 2. Claude primary, GPT advisor: Stop queues a review, GPT gets it via the thread queue
 const link = await call("link_create", { primary: CLAUDE, advisor: GPT });
+r = await runHook("claude", "prompt", { session_id: CLAUDE.id, prompt: "Please refactor the parser." });
+assert.equal(r.out, "", "no notes yet, so no context output");
 r = await runHook("claude", "stop", { session_id: CLAUDE.id, last_assistant_message: "Refactored the parser." });
 assert.equal(r.code, 0);
 assert.equal(r.out, "", "Stop must not block or print");
@@ -75,8 +77,9 @@ assert.ok(r.ms < 1500, `stop hook took ${r.ms} ms`);
 const req = await until(() => state().messages.find((m) => m.kind === "review-request"));
 assert.deepEqual(req.toEndpoint, GPT);
 assert.match(req.text, /Refactored the parser/);
+assert.match(req.text, /User's message:\nPlease refactor the parser\./, "review request must carry the user's question");
 await until(() => events().find((e) => e.op === "fake-codex-deliver" && e.threadId === GPT.id));
-console.log(`2 Claude→GPT review request ${req.id} queued by Stop (${r.ms} ms), delivered to the GPT thread`);
+console.log(`2 Claude→GPT review request ${req.id} (question + answer) queued by Stop (${r.ms} ms), delivered to the GPT thread`);
 
 // 3. GPT receives and advises a concern → Claude's listener wakes it (exit 2)
 const got = await call("receive", { side: "openai", endpoint: GPT });
@@ -120,14 +123,31 @@ assert.ok(l2.joinCode);
 await call("link_join", { code: l2.joinCode, endpoint: CLAUDE2 });
 const advisorListener = runHook("claude", "listen", { session_id: CLAUDE2.id });
 await sleep(1200);
+await runHook("openai", "prompt", { session_id: GPT.id, turn_id: "t9", prompt: "Write a reversible migration." });
 r = await runHook("openai", "stop", { session_id: GPT.id, turn_id: "t9", last_assistant_message: "Wrote the migration." });
 assert.equal(r.out, "");
 r = await advisorListener;
 assert.equal(r.code, 2);
 assert.match(r.err, /Review request/);
+const gptReq = await until(() => state().messages.find((m) => m.kind === "review-request" && m.linkId === l2.id));
+assert.match(gptReq.text, /User's message:\nWrite a reversible migration\./);
 await call("advise", { endpoint: CLAUDE2, verdict: "incorrect", severity: "blocker", note: "Migration is not reversible." });
 await until(() => events().some((e) => e.op === "fake-codex-deliver" && /flagged your last turn/.test(e.text)));
-console.log("6 GPT primary → Claude advisor (join code): listener woke Claude, blocker queued back to the GPT thread");
+console.log("6 GPT primary → Claude advisor (join code): listener woke Claude (question + answer), blocker queued back to the GPT thread");
+
+// 6b. a question is only attached to its own turn: other turn id → not
+// captured, and it is not reused for the turn after
+await call("receive", { side: "claude", endpoint: CLAUDE2 });
+await runHook("openai", "stop", { session_id: GPT.id, turn_id: "t10", last_assistant_message: "Applied the fix." }); // advisory follow-up, skipped
+await runHook("openai", "prompt", { session_id: GPT.id, turn_id: "t11", prompt: "Old question." });
+await runHook("openai", "stop", { session_id: GPT.id, turn_id: "t12", last_assistant_message: "Answer to t12." });
+const t12 = await until(() => state().messages.find((m) => m.kind === "review-request" && /Answer to t12/.test(m.text)));
+assert.match(t12.text, /User's message:\n\(not captured\)/);
+assert.doesNotMatch(t12.text, /Old question/);
+await runHook("openai", "stop", { session_id: GPT.id, turn_id: "t13", last_assistant_message: "Answer to t13." });
+const t13 = await until(() => state().messages.find((m) => m.kind === "review-request" && /Answer to t13/.test(m.text)));
+assert.doesNotMatch(t13.text, /Old question/);
+console.log("6b question attached only to its own turn, never reused");
 
 // 7. one listener per session: a newer one supersedes the older
 await call("receive", { side: "claude", endpoint: CLAUDE2 });

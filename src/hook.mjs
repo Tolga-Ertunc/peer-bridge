@@ -4,7 +4,8 @@
 //
 // stop    Stop, sync: if this chat is a link's primary, drop the turn's final
 //         message in the outbox for review. Never blocks, never waits.
-// prompt  UserPromptSubmit: hand the advisor's pending nits to the model as
+// prompt  UserPromptSubmit: record the user's message for this turn's review
+//         request, and hand the advisor's pending nits to the model as
 //         additional context.
 // listen  Claude only, registered with asyncRewake on Stop and SessionStart:
 //         waits in the background for a message addressed to this session and
@@ -59,14 +60,19 @@ const t0 = Date.now();
 if (event === "stop") {
   const link = activeLinks(readState()).find((l) => sameEndpoint(l.primary, endpoint) && l.advisor);
   if (link) {
-    writeOutbox("turn_end", { endpoint, turnId: input.turn_id ?? null, lastMessage: input.last_assistant_message ?? "" });
+    writeOutbox("turn_end", { endpoint, turnId: input.turn_id ?? input.prompt_id ?? null, lastMessage: input.last_assistant_message ?? "" });
     hookLog({ link: link.id, queued: "turn_end", ms: Date.now() - t0 });
   }
   process.exit(0);
 }
 
 if (event === "prompt") {
-  const notes = (readState()?.notes ?? []).filter((n) => sameEndpoint(n.to, endpoint) && !n.deliveredAt);
+  const state = readState();
+  // the user's message goes into this turn's review request, so the advisor
+  // sees what was asked and not just the answer
+  if (activeLinks(state).some((l) => sameEndpoint(l.primary, endpoint)) && input.prompt)
+    writeOutbox("turn_start", { endpoint, turnId: input.turn_id ?? input.prompt_id ?? null, prompt: input.prompt });
+  const notes = (state?.notes ?? []).filter((n) => sameEndpoint(n.to, endpoint) && !n.deliveredAt);
   if (notes.length) {
     writeOutbox("notes_ack", { ids: notes.map((n) => n.id) });
     const context =
