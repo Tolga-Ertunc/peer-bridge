@@ -26,7 +26,7 @@ const TOKEN_FILE = path.join(DATA_DIR, "token");
 const PORT = Number(process.env.PEER_BRIDGE_PORT || 7457);
 // Bumped whenever ops change. An owner running older code (a long-lived helper
 // left over from before an update) steps down when a newer client calls.
-export const PROTOCOL = Number(process.env.PEER_BRIDGE_TEST_PROTOCOL || 4);
+export const PROTOCOL = Number(process.env.PEER_BRIDGE_TEST_PROTOCOL || 5);
 
 export const SIDES = ["claude", "openai"];
 const MAX_TEXT = 40_000;
@@ -144,11 +144,14 @@ class BrokerState {
   }
 
   // Bounded state: read messages and delivered notes go after a day, anything
-  // after a week; closed links after a week; a link keeps its last 50 advisories
+  // after a week; closed links after a week; a link keeps its last 50
+  // advisories. Unread messages are only ever dropped by age, never by count.
   prune() {
     const s = this.s;
     const now = Date.now();
-    s.messages = s.messages.filter((m) => !(m.readAt && now - m.readAt > DAY) && now - m.ts < 7 * DAY).slice(-500);
+    const fresh = s.messages.filter((m) => !(m.readAt && now - m.readAt > DAY) && now - m.ts < 7 * DAY);
+    const keepRead = new Set(fresh.filter((m) => m.readAt).slice(-500));
+    s.messages = fresh.filter((m) => !m.readAt || keepRead.has(m));
     s.notes = s.notes.filter((n) => !(n.deliveredAt && now - n.deliveredAt > DAY) && now - n.at < 7 * DAY);
     for (const [id, l] of Object.entries(s.links)) {
       if (!l.active && now - (l.closedAt ?? l.createdAt) > 7 * DAY) delete s.links[id];
@@ -365,10 +368,22 @@ class BrokerState {
   // Advisor mode: blocker/concern wake the primary once, nits wait for its
   // next prompt, repeated notes are dropped. Review mode: the answer always
   // goes back and the link closes.
-  op_advise({ endpoint, verdict, severity, note, findings }) {
+  // The answer is for one request: the one named, or the only open one. With
+  // several open requests (a chat advising more than one link) the request id
+  // is required, so an answer can't land on the wrong link.
+  op_advise({ endpoint, requestId, verdict, severity, note, findings }) {
     if (!SEVERITIES.includes(severity)) throw new Error(`severity must be one of ${SEVERITIES.join("|")}`);
-    const req = this.s.messages.findLast((m) => m.kind === "review-request" && sameEndpoint(m.toEndpoint, endpoint) && m.readAt && !m.answeredAt);
-    const link = (req && this.s.links[req.linkId]?.active && this.s.links[req.linkId]) || this.linkFor("advisor", endpoint);
+    const open = this.s.messages.filter(
+      (m) => m.kind === "review-request" && sameEndpoint(m.toEndpoint, endpoint) && !m.answeredAt && this.s.links[m.linkId]?.active,
+    );
+    let req;
+    if (requestId) {
+      req = open.find((m) => m.id === requestId);
+      if (!req) throw new Error(`no open review request ${requestId} for this chat (open: ${open.map((m) => m.id).join(", ") || "none"})`);
+    } else if (open.length > 1) {
+      throw new Error(`several review requests are open (${open.map((m) => m.id).join(", ")}); pass request_id`);
+    } else req = open[0];
+    const link = req ? this.s.links[req.linkId] : this.linkFor("advisor", endpoint);
     if (!link) throw new Error("this chat is not the advisor of an active link");
     if (req) req.answeredAt = Date.now();
     const body = [note?.trim(), ...(findings ?? []).map((f) => `- ${typeof f === "string" ? f : JSON.stringify(f)}`)].filter(Boolean).join("\n");
@@ -407,19 +422,22 @@ class BrokerState {
     return { id: msg.id };
   }
 
-  // Free-form peer message (bridge_send). `from` is fixed by the calling
-  // server's --side, never by the model.
-  op_send({ from, to, text }) {
-    if (!to) to = SIDES.find((x) => x !== from);
-    if (!SIDES.includes(to)) throw new Error(`bad recipient: ${to}`);
+  // Free-form message (bridge_send) to the chat on the other end of this
+  // chat's most recent active link, so it is delivered and wakes it like any
+  // other link message. Guarded against two agents chatting in a loop.
+  op_send({ endpoint, text }) {
     if (typeof text !== "string" || !text.trim()) throw new Error("empty message");
     if (text.length > MAX_TEXT) throw new Error(`message too long (${text.length} > ${MAX_TEXT})`);
-    const recent = this.s.messages.filter((m) => !m.kind && m.from === from && Date.now() - m.ts < PEER_BURST.windowMs).length;
-    if (recent >= PEER_BURST.count) throw new Error(`more than ${PEER_BURST.count} peer messages in 10 minutes; looks like a loop, wait a bit`);
-    const msg = { id: "m" + ++this.s.seq, from, to, text, ts: Date.now(), readAt: null };
-    this.s.messages.push(msg);
-    logEvent({ op: "send", id: msg.id, from, to, len: text.length });
-    return { id: msg.id };
+    const link = Object.values(this.s.links)
+      .filter((l) => l.active && l.advisor && (sameEndpoint(l.primary, endpoint) || sameEndpoint(l.advisor, endpoint)))
+      .at(-1);
+    if (!link) throw new Error("this chat has no active link; set one up with bridge_link or bridge_review first");
+    const to = sameEndpoint(link.primary, endpoint) ? link.advisor : link.primary;
+    const recent = this.s.messages.filter((m) => m.kind === "message" && sameEndpoint(m.fromEndpoint, endpoint) && Date.now() - m.ts < PEER_BURST.windowMs).length;
+    if (recent >= PEER_BURST.count) throw new Error(`more than ${PEER_BURST.count} messages in 10 minutes; looks like a loop, wait a bit`);
+    const r = this.post({ from: endpoint.app, toEndpoint: to, kind: "message", linkId: link.id, text });
+    this.s.messages.at(-1).fromEndpoint = endpoint;
+    return { ...r, to, linkId: link.id };
   }
 
   // Messages for a specific chat only reach that chat; untargeted ones any

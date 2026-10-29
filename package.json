@@ -6,9 +6,10 @@
   "type": "module",
   "scripts": {
     "smoke": "node scripts/smoke.mjs",
+    "test:git": "node scripts/test-git.mjs",
     "test:link": "node scripts/test-link.mjs",
     "test:install": "node scripts/test-install.mjs",
-    "test": "node scripts/smoke.mjs && node scripts/test-link.mjs && node scripts/test-install.mjs"
+    "test": "node scripts/test-git.mjs && node scripts/smoke.mjs && node scripts/test-link.mjs && node scripts/test-install.mjs"
   },
   "keywords": [
     "mcp",

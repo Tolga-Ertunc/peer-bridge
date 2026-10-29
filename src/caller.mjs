@@ -72,6 +72,14 @@ export async function identify(side, extra) {
     // Codex sends the calling thread directly
     caller.threadId = meta.threadId ?? null;
     caller.sessionId = meta.sessionId ?? null;
+    // shape not documented; shown in bridge_status so a cwd in it can be found
+    let tm = meta["x-codex-turn-metadata"];
+    try {
+      if (typeof tm === "string") tm = JSON.parse(tm);
+    } catch {
+      // not JSON
+    }
+    caller.turnMetadataKeys = tm && typeof tm === "object" ? Object.keys(tm) : typeof tm;
   }
   return caller;
 }

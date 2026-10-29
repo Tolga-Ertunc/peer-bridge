@@ -279,3 +279,17 @@ Eksik: inceleme isteğinde sadece primary'nin son mesajı var; kullanıcının s
 - **Tek seferlik reviewer:** `bridge_review` (Claude'dan yeni ChatGPT thread'i + model, ya da her iki uygulamada join kodu). Cevap her severity'de geri gelir, bağlantı kapanır; kapanan bağlantıya rağmen cevap dinleyiciyi uyandırır (yarış durumu düzeltildi).
 - **Temizlik:** MCP Apps paneli (`bridge_join`, widget, poll/claim) ve uyandırma deneyi script'leri kaldırıldı (git geçmişinde duruyor). Smoke testi MCP üzerinden iki gerçek sunucuyla baştan yazıldı. Broker protokolü 4.
 - **Lisans:** kullanıcı kararıyla yok (tüm hakları saklı).
+
+## İlk canlı one-off review (R2) ve bulgularının düzeltilmesi — 2026-10-29
+
+Kullanıcı `bridge_review` ile `9deb2be`'yi yeni bir ChatGPT thread'inde (gpt-6.1-sol) incelettirdi; cevap Claude oturumuna kendiliğinden döndü (özellik canlı doğrulandı). Reviewer 2 P1 + 6 P2 buldu, hepsi doğrulandı ve düzeltildi:
+
+- P1 sır sızıntısı: dışlama sadece dosya adına bakıyordu (`secrets/config.json`, `.envrc` geçiyordu) → klasör kalıpları (`secrets/`, `.ssh/`, `.aws/`, `*secret*/`, `*credential*/`…) ve `.env*`, `.netrc`, `.npmrc` eklendi; izlenmeyen dosya listesine de uygulanıyor.
+- P1 cevap yanlış isteğe: `bridge_advise` artık `request_id` alıyor; birden fazla açık istek varken id'siz cevap reddediliyor (test 16).
+- P2 commit'siz repo: `git stash create` hatası yakalanıyor, boş ağaçla diff (test-git 2).
+- P2 okunmamış mesajlar sayıyla silinmiyor; sınır sadece okunmuşlara (test 17, 600 okunmamış).
+- P2 önceden izlenmeyen dosyadaki düzenleme: baseline'da içerik hash'leri, değişenler listeleniyor (test-git 3).
+- P2 boyut sınırı stat ve listeleri de kapsıyor (test-git 4).
+- P2 one-off review diff'i: Claude'da oturumun `CLAUDE_PROJECT_DIR`'ı; ChatGPT'de paylaşılan sunucunun cwd'si asla kullanılmıyor, klasör bilinmiyorsa diff eklenmiyor ve bu açıkça yazılıyor (smoke 5c). `x-codex-turn-metadata` alanlarının adları `bridge_status`'ta görünüyor, içinde cwd varsa kullanılacak.
+- P2 `bridge_send` kimseyi uyandırmıyordu: artık son aktif bağlantının diğer ucuna hedefli mesaj (uyandırır), bağlantı yoksa reddedilir (smoke 5b).
+- Ek: yeni ChatGPT thread'leri için `effort` (config override + `thread/settings/update`); canlı doğrulandı, masaüstü uygulamasının turunda `"effort":"low"`.

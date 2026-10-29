@@ -81,10 +81,18 @@ async function withServer(fn, opts) {
 
 // New named thread with a chosen model, without running a model turn
 // (`inject_items` is what makes a turn-less thread persist)
-export function createThread({ model, cwd, name, seed, sandbox }, opts) {
+// (`effort` is set both as a config override and as a thread setting, so it
+// holds whichever the desktop app picks up when it resumes the thread)
+export function createThread({ model, effort, cwd, name, seed, sandbox }, opts) {
   return withServer(async (s) => {
-    const r = await s.rpc("thread/start", { model: model ?? null, cwd: cwd ?? process.cwd(), sandbox: sandbox ?? null });
+    const r = await s.rpc("thread/start", {
+      model: model ?? null,
+      cwd: cwd ?? process.cwd(),
+      sandbox: sandbox ?? null,
+      ...(effort && { config: { model_reasoning_effort: effort } }),
+    });
     const threadId = r.thread.id;
+    if (effort) await s.rpc("thread/settings/update", { threadId, effort });
     const text = seed ?? "This thread is driven by peer-bridge.";
     await s.rpc("thread/inject_items", { threadId, items: [{ type: "message", role: "developer", content: [{ type: "input_text", text }] }] });
     if (name) await s.rpc("thread/name/set", { threadId, name });

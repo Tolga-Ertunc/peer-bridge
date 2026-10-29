@@ -26,7 +26,16 @@ primary chat ──Stop hook──▶ outbox ──▶ broker ──▶ advisor 
 - the primary's final answer,
 - the git diff of what changed in the working tree during the turn.
 
-**Diff baseline.** The `UserPromptSubmit` hook takes a snapshot when the turn starts, using `git stash create`, which doesn't touch any files or refs. Files that tend to hold secrets (`.env*`, keys, certificates, `*secret*`, `*credential*`) are never included, not even by name.
+**Diff baseline.** The `UserPromptSubmit` hook takes a snapshot when the turn starts, using `git stash create`, which doesn't touch any files or refs.
+
+- Edits to files that were already untracked when the turn started are listed by name.
+- Repos without commits work.
+- The whole diff, including the summary, is capped.
+
+**Secrets.** Paths that tend to hold secrets are never included, neither their content nor their names:
+
+- files: `.env*`, keys and certificates, `*secret*`, `*credential*`, `.netrc`, `.npmrc`;
+- whole directories: `secrets/`, `.ssh/`, `.aws/`, and any directory named like `*secret*` or `*credential*`.
 
 **Waking the other chat:**
 
@@ -49,19 +58,19 @@ Repeated notes are dropped. A one-off review always sends its answer back, then 
 - a ChatGPT delivery fails (for example, the app isn't available),
 - a Claude advisor session isn't open and listening.
 
-**Broker.** A small local store shared by both apps' MCP servers: localhost HTTP plus a state file. Hooks never use the network; they read the state file and drop requests into an outbox folder. If the owning process dies, another server takes over within about 2 s. Old messages are pruned: read ones after a day, everything after a week.
+**Broker.** A small local store shared by both apps' MCP servers: localhost HTTP plus a state file. Hooks never use the network; they read the state file and drop requests into an outbox folder. If the owning process dies, another server takes over within about 2 s. Old messages are pruned: read ones after a day, everything after a week. Unread messages are never dropped by count.
 
 ## Tools
 
 | Tool | Purpose |
 |---|---|
-| `bridge_link` | Make this chat a primary whose every turn is reviewed. From Claude, `advisor="openai"` creates a new ChatGPT advisor thread (you pick the model; it runs read-only). `advisor="join"` returns a code that any existing chat can use. |
-| `bridge_review` | Ask for a one-off review of a `request`, with uncommitted changes attached. From Claude, `reviewer="openai"` opens a new ChatGPT thread (for example `model="gpt-6-luna"`). `reviewer="join"` returns a code. The answer arrives as a new turn. |
+| `bridge_link` | Make this chat a primary whose every turn is reviewed. From Claude, `advisor="openai"` creates a new ChatGPT advisor thread, running read-only, where you can pick the `model` and reasoning `effort`. `advisor="join"` returns a code that any existing chat can use. |
+| `bridge_review` | Ask for a one-off review of a `request`. The chat's own uncommitted changes are attached; on the ChatGPT side they are attached only when the project folder is known. From Claude, `reviewer="openai"` opens a new ChatGPT thread (for example `model="gpt-6-luna"`, `effort="high"`). `reviewer="join"` returns a code. The answer arrives as a new turn. |
 | `bridge_link_join` | Become the advisor or reviewer of a link, using its code. |
-| `bridge_advise` | The advisor's or reviewer's structured answer. |
+| `bridge_advise` | The advisor's or reviewer's structured answer. It names the request it answers (`request_id`), so a chat serving several links can't mix them up. |
 | `bridge_unlink` | Close this chat's links. |
 | `bridge_status` | Show this chat's links, their health, whether Claude sides are listening, and pending notes. |
-| `bridge_receive` / `bridge_send` | Read incoming messages. Send free-form messages to the other app. |
+| `bridge_receive` / `bridge_send` | Read incoming messages. `bridge_send` sends a free-form message to the chat on the other end of this chat's latest link, which is woken to read it. |
 
 ## Install
 
@@ -96,6 +105,7 @@ Restart both apps afterwards. Hooks point at this checkout, so re-run the instal
 npm test
 ```
 
+- `scripts/test-git.mjs`: turn diffs (secret exclusion, repos without commits, untracked edits, size cap).
 - `scripts/smoke.mjs`: end to end over MCP with two real server processes, the hooks, and a throwaway git repo.
 - `scripts/test-link.mjs`: links, reviews, hooks, error notes, pruning and broker ownership handover.
 - `scripts/test-install.mjs`: install, reinstall and uninstall against throwaway config directories.

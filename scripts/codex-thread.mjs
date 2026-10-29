@@ -1,6 +1,6 @@
 // Experimental: hand a prompt to ChatGPT Desktop through the app's own queue
 // (see src/codex.mjs).
-//   node scripts/codex-thread.mjs --new --model gpt-6-luna [--name N] [--seed S] "prompt"
+//   node scripts/codex-thread.mjs --new --model gpt-6-luna [--effort low] [--name N] [--seed S] "prompt"
 //   node scripts/codex-thread.mjs --thread <id> "prompt"     (add --no-wake to skip the deep link)
 //   node scripts/codex-thread.mjs --thread <id> --list | --clear
 
@@ -17,6 +17,7 @@ const flag = (name) => {
 };
 const isNew = flag("--new");
 const model = opt("--model");
+const effort = opt("--effort");
 const name = opt("--name");
 const seed = opt("--seed");
 const cwd = opt("--cwd");
@@ -31,7 +32,7 @@ const t0 = Date.now();
 const log = (...a) => console.log(`+${((Date.now() - t0) / 1000).toFixed(1)}s`, ...a);
 
 if (isNew) {
-  const r = await createThread({ model, cwd, name, seed }, opts);
+  const r = await createThread({ model, effort, cwd, name, seed }, opts);
   threadId = r.threadId;
   log("created", threadId, "model", r.model);
 }

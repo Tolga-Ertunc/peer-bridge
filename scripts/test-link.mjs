@@ -212,6 +212,39 @@ console.log(`8 after unlink the listener exits at once (${r.ms} ms)`);
   console.log(`12 250 review requests accepted (no cap); pruning checked below`);
 }
 
+// 16. one chat reviewing for two links at once: the answer goes to the
+// request it names, and without a name it's refused instead of guessed
+{
+  const RV = { app: "claude", id: "claude-busy-reviewer" };
+  const A = { app: "claude", id: "claude-requester-a" };
+  const B = { app: "claude", id: "claude-requester-b" };
+  const la = await call("link_create", { primary: A, mode: "review", advisor: RV, request: "Review A." });
+  const lb = await call("link_create", { primary: B, mode: "review", advisor: RV, request: "Review B." });
+  const msgs = (await call("receive", { side: "claude", endpoint: RV })).messages;
+  const reqA = msgs.find((m) => /Review A/.test(m.text)).id;
+  await assert.rejects(call("advise", { endpoint: RV, verdict: "correct", severity: "none", note: "" }), /several review requests are open/);
+  await call("advise", { endpoint: RV, requestId: reqA, verdict: "correct", severity: "nit", note: "A is fine." });
+  const st = state();
+  assert.equal(st.links[la.id].active, false, "A's review closed");
+  assert.equal(st.links[lb.id].active, true, "B's review still open");
+  assert.ok(st.messages.some((m) => m.kind === "review-result" && sameTo(m.toEndpoint, A) && /A is fine/.test(m.text)));
+  assert.ok(!st.messages.some((m) => m.kind === "review-result" && sameTo(m.toEndpoint, B)));
+  await call("advise", { endpoint: RV, verdict: "correct", severity: "none", note: "" }); // only B open now
+  assert.equal(state().links[lb.id].active, false);
+  console.log("16 concurrent reviews: answer routed by request id, ambiguity refused");
+}
+
+// 17. pruning never drops unread messages by count
+{
+  const P = { app: "claude", id: "claude-flood" };
+  const A = { app: "claude", id: "claude-flood-advisor" };
+  await call("link_create", { primary: P, advisor: A });
+  for (let i = 0; i < 600; i++) await call("turn_end", { endpoint: P, turnId: `f${i}`, lastMessage: `turn ${i}` });
+  const unread = state().messages.filter((m) => sameTo(m.toEndpoint, A) && !m.readAt).length;
+  assert.equal(unread, 600, `all 600 unread review requests kept (got ${unread})`);
+  console.log("17 600 unread messages kept; only read ones are capped");
+}
+
 // 14. owner dies while idle: a surviving server's keepOwner ping takes over and
 // ingests the hook's request (this process stops owning by exiting the child
 // test below, so run it on a fresh port + dir)

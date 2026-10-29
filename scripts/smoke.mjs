@@ -79,6 +79,9 @@ console.log(`2 link ${link.id}: Claude session (env) ↔ ChatGPT thread (_meta)`
 await runHook("claude", "prompt", { session_id: SESSION, prompt_id: "p1", prompt: "Make parse trim whitespace." });
 fs.writeFileSync(path.join(repo, "parser.js"), "export const parse = (s) => s.split(',').map((x) => x.trim());\n");
 fs.writeFileSync(path.join(repo, ".env"), "API_KEY=super-secret\n");
+fs.writeFileSync(path.join(repo, ".envrc"), "export API_KEY=super-secret\n");
+fs.mkdirSync(path.join(repo, "secrets"));
+fs.writeFileSync(path.join(repo, "secrets", "config.json"), '{"token":"super-secret"}');
 fs.writeFileSync(path.join(repo, "notes.md"), "new file\n");
 const stop = await runHook("claude", "stop", { session_id: SESSION, prompt_id: "p1", last_assistant_message: "parse now trims each field." });
 assert.equal(stop.code, 0);
@@ -88,11 +91,12 @@ assert.match(req, /User's message:\nMake parse trim whitespace\./);
 assert.match(req, /Primary's final message:\nparse now trims each field\./);
 assert.match(req, /\+export const parse = \(s\) => s\.split\(','\)\.map\(\(x\) => x\.trim\(\)\);/);
 assert.match(req, /New untracked files:\nnotes\.md/);
-assert.doesNotMatch(req, /super-secret|\.env/, "secret files must never be sent");
-console.log("3 review request carries the question, the answer and the turn's diff; .env left out");
+assert.doesNotMatch(req, /super-secret|\.env|secrets\//, "secret files must never be sent, not even by name");
+const reqId = req.match(/id=(m\d+) kind=review-request/)[1];
+console.log("3 review request carries the question, the answer and the turn's diff; .env, .envrc, secrets/ left out");
 
 // 4. advisor raises a concern → Claude gets it
-await call(openai, "bridge_advise", { verdict: "incorrect", severity: "concern", note: "Empty fields are kept; filter them out?" }, asGpt(THREAD));
+await call(openai, "bridge_advise", { request_id: reqId, verdict: "incorrect", severity: "concern", note: "Empty fields are kept; filter them out?" }, asGpt(THREAD));
 assert.match(await receiveUntil(claude, undefined, /kind=advisory/), /Empty fields are kept/);
 console.log("4 concern delivered to the Claude primary");
 
@@ -103,12 +107,29 @@ const revReq = await receiveUntil(openai, asGpt(REVIEWER), /kind=review-request/
 assert.match(revReq, /Is the trim change safe for quoted CSV\?/);
 assert.match(revReq, /Uncommitted changes in .*:/);
 assert.doesNotMatch(revReq, /super-secret/);
-await call(openai, "bridge_advise", { verdict: "unclear", severity: "nit", note: "Quoted fields with commas will still split." }, asGpt(REVIEWER));
+const revId = revReq.match(/id=(m\d+) kind=review-request/)[1];
+await call(openai, "bridge_advise", { request_id: revId, verdict: "unclear", severity: "nit", note: "Quoted fields with commas will still split." }, asGpt(REVIEWER));
 assert.match(await receiveUntil(claude, undefined, /kind=review-result/), /Quoted fields with commas/);
 const status = JSON.parse(textOf(await call(claude, "bridge_status")));
 assert.equal(status.chat.id, SESSION);
 assert.equal(status.links.find((l) => l.id === rev.id).active, false, "one-off review link closes after its answer");
 console.log(`5 one-off review ${rev.id}: request with diff → answer back → link closed`);
+
+// 5b. bridge_send goes to the linked chat (and so wakes it); no link, no send
+await call(claude, "bridge_send", { text: "Heads up: I'm also changing the tokenizer." });
+assert.match(await receiveUntil(openai, asGpt(THREAD), /kind=message/), /changing the tokenizer/);
+const lonely = await openai.callTool({ name: "bridge_send", arguments: { text: "hello?" }, _meta: asGpt("gpt-thread-unlinked") });
+assert.ok(lonely.isError && /no active link/.test(textOf(lonely)));
+console.log("5b bridge_send reaches the linked chat; refused without a link");
+
+// 5c. a review asked from the ChatGPT side never attaches some other project's changes
+const gptRev = (await call(openai, "bridge_review", { reviewer: "join", request: "Sanity-check my plan." }, asGpt(THREAD))).structuredContent;
+await call(claude, "bridge_link_join", { code: gptRev.joinCode });
+const gptReq = await receiveUntil(claude, undefined, /kind=review-request/);
+assert.match(gptReq, /not attached: this chat's project folder is unknown/);
+assert.doesNotMatch(gptReq, /parser\.js/);
+await call(claude, "bridge_advise", { verdict: "correct", severity: "none", note: "" });
+console.log("5c ChatGPT-side review without a known project folder attaches no diff");
 
 // 6. status from the ChatGPT side knows its own chat; unlink ends reviews
 const gptStatus = JSON.parse(textOf(await call(openai, "bridge_status", {}, asGpt(THREAD))));
