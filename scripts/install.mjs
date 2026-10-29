@@ -54,13 +54,15 @@ function setHooks(cfg, wanted) {
 // PowerShell call operator when short names are disabled on the volume.
 function codexWindowsCmd(event) {
   let node = process.execPath;
-  try {
-    // verbatim: Node's own quoting would mangle the quotes cmd needs here
-    const short = execFileSync("cmd.exe", [`/d /c for %I in ("${process.execPath}") do @echo %~sI`], { encoding: "utf8", windowsVerbatimArguments: true }).trim();
-    if (short && fs.existsSync(short)) node = short;
-  } catch {
-    // keep the long path
-  }
+  // PEER_BRIDGE_NO_SHORT_NAMES: act as on a volume without 8.3 names (tests)
+  if (!process.env.PEER_BRIDGE_NO_SHORT_NAMES)
+    try {
+      // verbatim: Node's own quoting would mangle the quotes cmd needs here
+      const short = execFileSync("cmd.exe", [`/d /c for %I in ("${process.execPath}") do @echo %~sI`], { encoding: "utf8", windowsVerbatimArguments: true }).trim();
+      if (short && fs.existsSync(short)) node = short;
+    } catch {
+      // keep the long path
+    }
   const rest = `"${hookScript}" --app openai --event ${event}`;
   return /\s/.test(node) ? `& "${node}" ${rest}` : `${node} ${rest}`;
 }

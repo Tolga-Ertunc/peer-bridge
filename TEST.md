@@ -306,3 +306,12 @@ ChatGPT Desktop tamamen kapalıyken (çalışan tek süreç `codex-windows-sandb
 | ~+10 sn | tur bitti: "kapalıyken ok" |
 
 Görünür pencere açılmadı (`MainWindowHandle` olan süreç 0): uygulama wake-only modda arka planda açılıp turu çalıştırdı. Sonuç: ChatGPT tarafı uygulama kapalıyken de uyandırılabiliyor; uygulama bundan sonra arka planda açık kalıyor.
+
+## 8.3 olmayan disk için yedek komut + Codex hook onayı (F1) — 2026-10-29 14:30–14:40 UTC
+
+- Kod yolu doğrulandı: `PEER_BRIDGE_NO_SHORT_NAMES=1` ile installer `& "…node.exe" "…hook.mjs" …` yazıyor ve bu PowerShell'de hook'u çalıştırıyor (`test-install.mjs`).
+- Yerelde: `node "…hook.mjs"` (PATH) cmd ve PowerShell'de çalışıyor; `call "…"` sadece cmd'de; `& "…"` sadece PowerShell'de.
+- Canlı deneme sonuçsuz: gerçek `~/.codex/hooks.json`'da Stop komutu değiştirildi, değiştirilmiş Stop hook'ları hiç çalışmadı, değiştirilmemiş UserPromptSubmit çalıştı. Sebep büyük ihtimalle **Codex hook onayı**: `config.toml`'da `[hooks.state.'<hooks.json>:stop:0:0'] trusted_hash = "sha256:…"` tutuluyor; komutu değişen hook yeniden onaylanana kadar atlanıyor. Codex `hooks.json`'u çalışırken yeniden okumuyor (açılışta okuyor). Onay hash'leri zaman zaman uygulama tarafından yeniden yazılıyor (12:53, 13:49, 14:37), ne zaman/nasıl verildiği net değil; penceresiz (wake-only) açılışta onay istemi gösterilemiyor.
+- Sonuç: Codex'in Windows'ta cmd mi PowerShell mi kullandığı hâlâ belirsiz (ilk "PowerShell" teşhisi de onay yüzünden olabilir). `hooks.json` birebir geri kondu (md5 aynı).
+- Ürün için önemli: kurulum/güncelleme hook komutunu değiştirirse ChatGPT tarafındaki tetikleyici, kullanıcı onaylayana kadar **sessizce** çalışmayabilir → `doctor` komutu `hooks.state` onaylarını kontrol etmeli; README'de belirtilmeli.
+- **Doğrulama (14:41 UTC):** `hooks.json` geri konup ChatGPT normal (pencereli) açıldı; onay istemi çıkmadı. Kuyruktan bir turda hem UserPromptSubmit hem **Stop** çalıştı; `trusted_hash` değerleri test sırasındakiyle aynı (`485e…`, `7558…`) → bunlar orijinal hook'ların onayı, geçici olarak değiştirilen girdiler onaysız oldukları için atlanmıştı. Ürün bozulmadı. Açık soru: onaylar ilk kurulumda ne zaman/nasıl yazılıyor (kullanıcı hiçbir onay istemi görmedi); Codex'in Windows shell'i hâlâ belirsiz.

@@ -61,4 +61,23 @@ assert.deepEqual(codex, { hooks: { PreToolUse: [{ matcher: "Bash", hooks: [other
 assert.equal(fs.readFileSync(path.join(codexDir, "config.toml"), "utf8").trim(), 'model = "x"');
 console.log("uninstall: only our entries removed");
 
+// Windows volume without 8.3 names: the PowerShell call-operator form is
+// written instead, and it runs the hook
+if (process.platform === "win32") {
+  execFileSync(process.execPath, [path.resolve(import.meta.dirname, "install.mjs")], { env: { ...env, PEER_BRIDGE_NO_SHORT_NAMES: "1" }, encoding: "utf8" });
+  const w = flat(read(path.join(codexDir, "hooks.json"))).Stop[0].commandWindows;
+  assert.ok(w.startsWith('& "') && w.includes(process.execPath), `fallback form expected, got: ${w}`);
+  const dataDir = path.join(root, "data");
+  execFileSync("powershell.exe", ["-NoProfile", "-Command", `'{"session_id":"fallback-probe"}' | ${w}; exit $LASTEXITCODE`], {
+    env: { ...env, PEER_BRIDGE_DIR: dataDir },
+  });
+  fs.writeFileSync(path.join(dataDir, "debug-hooks"), "");
+  execFileSync("powershell.exe", ["-NoProfile", "-Command", `'{"session_id":"fallback-probe"}' | ${w}; exit $LASTEXITCODE`], {
+    env: { ...env, PEER_BRIDGE_DIR: dataDir },
+  });
+  assert.match(fs.readFileSync(path.join(dataDir, "hooks.jsonl"), "utf8"), /"session_id":"fallback-probe"/, "fallback command must reach the hook");
+  install("--uninstall");
+  console.log("no 8.3 names: PowerShell call-operator fallback written and runs the hook");
+}
+
 fs.rmSync(root, { recursive: true, force: true });
