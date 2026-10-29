@@ -49,6 +49,9 @@ async function readStdin() {
 }
 
 const input = await readStdin();
+// diagnostics: with <data dir>/debug-hooks present, log every invocation
+if (fs.existsSync(path.join(DATA_DIR, "debug-hooks")))
+  hookLog({ debug: true, session_id: input.session_id ?? null, turn_id: input.turn_id ?? null, keys: Object.keys(input), argv: process.argv.slice(2) });
 const endpoint = input.session_id ? { app, id: input.session_id } : null;
 if (!endpoint || !["claude", "openai"].includes(app)) process.exit(0);
 const t0 = Date.now();

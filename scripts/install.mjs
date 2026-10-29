@@ -18,7 +18,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
-import { claudeConfigDir, claudeDesktopConfig, codexHome, findClaudeCli } from "../src/platform.mjs";
+import { IS_WIN, claudeConfigDir, claudeDesktopConfig, codexHome, findClaudeCli } from "../src/platform.mjs";
 
 const uninstall = process.argv.includes("--uninstall");
 const server = path.resolve(import.meta.dirname, "../src/server.mjs");
@@ -48,7 +48,29 @@ function setHooks(cfg, wanted) {
   return cfg;
 }
 
-const quick = (app, event) => ({ type: "command", command: hookCmd(app, event), timeout: 10 });
+// Codex on Windows doesn't run hook commands through a POSIX shell, and a
+// command line that starts with a quoted path is a parse error in PowerShell.
+// Use node's space-free 8.3 path there (valid in PowerShell and cmd), or the
+// PowerShell call operator when short names are disabled on the volume.
+function codexWindowsCmd(event) {
+  let node = process.execPath;
+  try {
+    // verbatim: Node's own quoting would mangle the quotes cmd needs here
+    const short = execFileSync("cmd.exe", [`/d /c for %I in ("${process.execPath}") do @echo %~sI`], { encoding: "utf8", windowsVerbatimArguments: true }).trim();
+    if (short && fs.existsSync(short)) node = short;
+  } catch {
+    // keep the long path
+  }
+  const rest = `"${hookScript}" --app openai --event ${event}`;
+  return /\s/.test(node) ? `& "${node}" ${rest}` : `${node} ${rest}`;
+}
+
+const quick = (app, event) => ({
+  type: "command",
+  command: hookCmd(app, event),
+  ...(app === "openai" && IS_WIN && { commandWindows: codexWindowsCmd(event) }),
+  timeout: 10,
+});
 // Claude's listener: background, wakes the session (exit 2) when a message
 // for it arrives; re-armed on every Stop and SessionStart
 const claudeListener = { type: "command", command: hookCmd("claude", "listen"), asyncRewake: true, timeout: 12 * 3600 };

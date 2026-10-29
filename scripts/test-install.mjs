@@ -41,6 +41,12 @@ assert.equal(claude.UserPromptSubmit.filter(ours).length, 1);
 assert.equal(codex.Stop.length, 1, "legacy blocking hook replaced");
 assert.ok(codex.Stop[0].command.includes("--event stop"));
 assert.ok(!codex.Stop[0].asyncRewake && codex.Stop[0].timeout === 10);
+if (process.platform === "win32") {
+  // PowerShell can't start a command line with a quoted path
+  const w = codex.Stop[0].commandWindows;
+  assert.ok(w && !w.startsWith('"'), `commandWindows must not start with a quote: ${w}`);
+  execFileSync("powershell.exe", ["-NoProfile", "-Command", `'{}' | ${w}; exit $LASTEXITCODE`], { env: { ...env, PEER_BRIDGE_DIR: root } });
+}
 assert.equal(codex.PreToolUse[0].command, "echo keep");
 const toml = fs.readFileSync(path.join(codexDir, "config.toml"), "utf8");
 assert.equal(toml.match(/>>> peer-bridge/g).length, 1);

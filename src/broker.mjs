@@ -265,7 +265,8 @@ class BrokerState {
     if (!link) throw new Error("this chat is not the advisor of an active link");
     if (!SEVERITIES.includes(severity)) throw new Error(`severity must be one of ${SEVERITIES.join("|")}`);
     const body = [note?.trim(), ...(findings ?? []).map((f) => `- ${typeof f === "string" ? f : JSON.stringify(f)}`)].filter(Boolean).join("\n");
-    const dup = link.advisories.some((a) => a.body === body && a.severity === severity);
+    // empty "nothing to say" answers aren't repeats of each other
+    const dup = !!body && link.advisories.some((a) => a.body === body && a.severity === severity);
     link.advisories.push({ at: Date.now(), verdict, severity, body, dup });
     if (dup || severity === "none" || !body) return { delivered: "none", dup };
     if (severity === "nit") {

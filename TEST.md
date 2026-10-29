@@ -257,3 +257,11 @@ Sonuç: `gpt-6-luna` ile yeni thread, prompt kuyruktan, cevap `luna seed ok` (wa
 Advisor'ın kendi süresi ~6 sn, Claude'un uyanması advise'tan 0,5 sn sonra.
 
 **25 sn gecikmenin nedeni:** `bridge_link`'in yeni thread için açtığı özel app-server kendi peer_bridge MCP sunucusunu başlattı; o sunucu broker sahibi oldu ve app-server kapanınca öldü. Broker sahipsiz kaldı; ChatGPT kendi sunucusunu tesadüfen başlatınca devralındı. Düzeltmeler: (1) özel app-server `-c mcp_servers.peer_bridge.enabled=false` ile açılıyor (doğrulandı, artık sunucu başlamıyor); (2) her MCP sunucusu `keepOwner()` ile 2 sn'de bir broker'ı yokluyor, sahip ölürse devralıyor (test 9: 260 ms); (3) broker protokol sürümü: eski kodla çalışan sahip (ör. güncellemeden kalan yardımcı süreç) yeni istemci gelince görevi bırakıyor (test 0). Bu düzeltmeler çalışan sunuculara uygulamalar yeniden başlayınca geçer.
+
+## Ters yön denemesi R1 (GPT primary → Claude advisor) — 2026-10-29 13:43–13:52 UTC
+
+ChatGPT'de `bridge_link(advisor=join)` → L2, bu Claude oturumu `bridge_link_join` ile advisor oldu (L1 önce kapatıldı). ChatGPT'de kasıtlı hatalı tur (13:45:20–23, "17*3 → 41") → **inceleme gitmedi, Claude uyanmadı.**
+
+Teşhis: Codex loglarında `hook/started`/`hook/completed` var, ama `debug-hooks` teşhis modunda bile bizim script'ten hiç satır yok → komut hiç başlamıyor. Codex Windows'ta hook komutunu POSIX shell'de çalıştırmıyor; tırnakla başlayan komut satırı (`"C:\Program Files\nodejs\node.exe" "…hook.mjs" …`) PowerShell'de parse hatası ("Expressions are only allowed as the first element of a pipeline"). Claude Code hook'ları git-bash'te çalıştırdığı için orada sorun yoktu.
+
+Düzeltme: Codex girdisine Windows'ta `commandWindows` eklendi: node'un 8.3 kısa yolu (`C:\PROGRA~1\nodejs\node.exe "…hook.mjs" …`), kısa ad yoksa `& "…"`. PowerShell ve cmd'de yerelde çalıştı; `test-install.mjs` bunu da kontrol ediyor. Ek bulgular: kısa yolu hesaplayan `cmd` çağrısı Node'un tırnaklamasıyla bozuluyordu (`windowsVerbatimArguments` ile düzeltildi); boş `none` notları artık tekrar sayılmıyor. Canlı doğrulama için installer'ın yeniden çalıştırılması gerekiyor.
